@@ -1184,15 +1184,6 @@ def _visible(el):
     except Exception:
         return False
 
-def _wait_filter_dropdown(drv, timeout: float):
-    def _finder(d):
-        dds = [e for e in d.find_elements(By.CSS_SELECTOR, "div.ant-dropdown") if _visible(e)]
-        for dd in dds:
-            if dd.find_elements(By.CSS_SELECTOR, ".ant-table-filter-dropdown"):
-                return dd
-        return None
-    return WebDriverWait(drv, timeout).until(_finder)
-
 def _parse_attr(pair: str):
     a, v = pair.split("=", 1)
     return a.strip(), v.strip().strip('"').strip("'")
@@ -2294,7 +2285,7 @@ def _try_open_filter_with_keywords(anchor: str, order_list: list[str], timeout: 
             _log(f"Open filter via {kind} — failed: {type(e).__name__}", level="DEBUG")
             continue
 
-        if _wait_filter_dropdown(drv, timeout=1.5):
+        if _wait_filter_dropdown_silent(drv, timeout=1.5):
             detected = _detect_filter_type()
             _log(f"Filter dropdown opened — detected: {detected}")
             return detected if detected != "unknown" else kind
@@ -2344,29 +2335,29 @@ def _open_filter_by_trigger(trig, timeout: float = 6.0) -> bool:
     for _ in range(3):
         try:
             trig.click()
-            if _wait_filter_dropdown(drv, 1.2):
-                return True
         except Exception:
             try:
                 ActionChains(drv).move_to_element(trig).pause(0.05).click().perform()
-                if _wait_filter_dropdown(drv, 1.2):
-                    return True
             except Exception:
                 try:
                     drv.execute_script("arguments[0].click()", trig)
-                    if _wait_filter_dropdown(drv, 1.2):
-                        return True
                 except Exception:
-                    pass
-    return _wait_filter_dropdown(drv, timeout)
+                    continue
+        if _wait_filter_dropdown_silent(drv, 1.2):
+            return True
+    return _wait_filter_dropdown_silent(drv, timeout)
 
 
-def _wait_filter_dropdown(drv, timeout: float = 4.0) -> bool:
+def _wait_filter_dropdown(drv, timeout: float = 4.0):
     sels = [".ant-table-filter-dropdown", ".ant-dropdown", ".ant-popover", ".ant-select-dropdown"]
+    return WebDriverWait(drv, timeout).until(lambda d: _last_visible_overlay(d, sels))
+
+
+def _wait_filter_dropdown_silent(drv, timeout: float = 4.0) -> bool:
     try:
-        WebDriverWait(drv, timeout).until(lambda d: _last_visible_overlay(d, sels) is not None)
+        _wait_filter_dropdown(drv, timeout)
         return True
-    except Exception:
+    except TimeoutException:
         return False
 
 
