@@ -25,6 +25,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import MoveTargetOutOfBoundsException
 from robot.api.deco import library
+from selenium.webdriver.support import expected_conditions as EC
 
 
 CSS_DD = ".ant-select-dropdown:not(.ant-select-dropdown-hidden)"
@@ -1741,12 +1742,7 @@ def _apply_params_with_retry(
         - str:  "text|label=\"Machine\"|200"
         - list: ["text|label=\"Machine\"|200", "click|attr=\"data-foo=bar\"|"]
     """
-    from robot.libraries.BuiltIn import BuiltIn
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    import re, time
+
 
     bi = BuiltIn()
     sl = bi.get_library_instance("SeleniumLibrary")
