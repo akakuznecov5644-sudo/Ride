@@ -1556,6 +1556,7 @@ def check_report_filters(
         raise AssertionError("Table headers not found")
 
     processed = 0
+    sorter_clicked = False
     for th in headers:
         if max_columns is not None and processed >= max_columns:
             break
@@ -1587,6 +1588,12 @@ def check_report_filters(
         # общий smoke для UI + минимальный интеракшн (внутри _smoke_filter_ui)
         try:
             _smoke_filter_ui(anchor, ftype, row_index=row_index)
+
+            if not sorter_clicked:
+                if _click_header_sorter_multiple_times(th, anchor, times=4, timeout=timeout):
+                    sorter_clicked = True
+                else:
+                    _log(f"[COLUMN] {anchor} — sorter control not available", level="DEBUG")
         except Exception as e:
             _log(f"[COLUMN] {anchor} — filter smoke failed: {type(e).__name__}: {e}", level="WARN")
         finally:
@@ -2469,6 +2476,76 @@ def _click_ok_in_filter():
         bi.run_keyword("Click By Text On Filter", "Apply")
     except Exception:
         pass
+
+
+def _click_header_sorter_multiple_times(th, anchor: str, *, times: int = 4, timeout: float = 4.0, delay: float = 0.1) -> bool:
+    """Кликает по сортировщику в заголовке несколько раз, с учётом возможного DOM-обновления."""
+    if times <= 0:
+        return False
+
+    drv = _drv()
+    anchor = (anchor or "").strip()
+
+    def _resolve_th():
+        nonlocal th
+        try:
+            _ = th.tag_name
+            return th
+        except StaleElementReferenceException:
+            th = None
+        except Exception:
+            pass
+        if th is not None:
+            return th
+        if anchor:
+            refreshed = _header_by_title(anchor)
+            if refreshed is not None:
+                th = refreshed
+                return refreshed
+        return None
+
+    def _find_sorter(target_th):
+        if target_th is None:
+            return None
+        try:
+            return target_th.find_element(By.CSS_SELECTOR, ".ant-table-column-sorter")
+        except Exception:
+            return None
+
+    for _ in range(times):
+        end_time = time.time() + max(timeout, 0.5)
+        while True:
+            target_th = _resolve_th()
+            sorter = _find_sorter(target_th)
+            if sorter is None:
+                return False
+            try:
+                drv.execute_script("arguments[0].scrollIntoView({block:'center',inline:'center'});", sorter)
+            except Exception:
+                pass
+            try:
+                sorter.click()
+                break
+            except StaleElementReferenceException:
+                th = None
+            except Exception:
+                try:
+                    drv.execute_script("arguments[0].click();", sorter)
+                    break
+                except Exception:
+                    pass
+
+            if time.time() > end_time:
+                return False
+            time.sleep(0.1)
+
+        time.sleep(delay)
+
+    _log(
+        f"[COLUMN] {anchor or '#'} — sorter clicked {times}x",
+        level="DEBUG",
+    )
+    return True
 
 
 def _clear_all_filters_if_present():
