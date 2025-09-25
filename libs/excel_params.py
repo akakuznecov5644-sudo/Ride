@@ -1584,21 +1584,9 @@ def check_report_filters(
         ftype = _resolve_filter_type()
         _log(f"[COLUMN] {anchor} — filter type: {ftype}")
 
-        # общий smoke для UI
-        _smoke_filter_ui(anchor, ftype, row_index=row_index)
-
-        # ДЛЯ каждого типа – минимальный интеракшн (см. вспомогательные функции)
+        # общий smoke для UI + минимальный интеракшн (внутри _smoke_filter_ui)
         try:
-            if ftype == "text":
-                _run_text_filter_smoke(anchor, row_index=row_index)
-            elif ftype == "numeric":
-                _run_numeric_filter_smoke(anchor, row_index=row_index)
-            elif ftype == "datetime":
-                _run_datetime_filter_smoke(anchor, row_index=row_index)
-            elif ftype == "multiselect":
-                _run_multiselect_filter_smoke(anchor, row_index=row_index)
-            else:
-                _log(f"[COLUMN] {anchor} — unknown filter type '{ftype}'", level="WARN")
+            _smoke_filter_ui(anchor, ftype, row_index=row_index)
         except Exception as e:
             _log(f"[COLUMN] {anchor} — filter smoke failed: {type(e).__name__}: {e}", level="WARN")
 
