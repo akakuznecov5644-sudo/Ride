@@ -2371,23 +2371,77 @@ def _detect_filter_type():
     dd = _last_visible_filter(drv, timeout=0.5)
     if not dd:
         return "unknown"
+
+    selector_priority = [
+        ".ant-table-filter-dropdown",
+        ".ant-dropdown",
+        ".ant-popover",
+        ".ant-select-dropdown",
+    ]
+
+    def _collect_visible_filters():
+        panels = []
+        seen_ids: set[str] = set()
+        for sel in selector_priority:
+            try:
+                nodes = drv.find_elements(By.CSS_SELECTOR, sel)
+            except Exception:
+                continue
+            for node in nodes:
+                try:
+                    node_id = getattr(node, "id", None)
+                except Exception:
+                    node_id = None
+                if node_id and node_id in seen_ids:
+                    continue
+                if not _visible(node):
+                    continue
+                if node_id:
+                    seen_ids.add(node_id)
+                panels.append(node)
+        try:
+            if dd in panels:
+                panels.remove(dd)
+        except Exception:
+            pass
+        panels.insert(0, dd)
+        return panels
+
+    checkbox_selectors = [
+        "input[type='checkbox']",
+        ".ant-checkbox",
+        ".ant-checkbox-wrapper",
+    ]
+
+    def _has_checkboxes(wait: float = 0.0) -> bool:
+        deadline = time.time() + max(0.0, wait)
+        while True:
+            for panel in _collect_visible_filters():
+                try:
+                    if any(panel.find_elements(By.CSS_SELECTOR, sel) for sel in checkbox_selectors):
+                        return True
+                except StaleElementReferenceException:
+                    continue
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.1)
+
     try:
         if dd.find_elements(By.CSS_SELECTOR, ".ant-picker .ant-picker-input input"):
-            texts = [i.get_attribute("value") or "" for i in dd.find_elements(By.CSS_SELECTOR, ".ant-picker .ant-picker-input input")]
+            texts = [
+                i.get_attribute("value") or ""
+                for i in dd.find_elements(By.CSS_SELECTOR, ".ant-picker .ant-picker-input input")
+            ]
             has_time = any(":" in t for t in texts)
             return "datetime" if has_time else "date"
 
-        checkbox_selectors = [
-            "input[type='checkbox']",
-            ".ant-checkbox",
-            ".ant-checkbox-wrapper",
-        ]
-        for _ in range(3):
-            if any(dd.find_elements(By.CSS_SELECTOR, sel) for sel in checkbox_selectors):
-                return "checkbox-list"
-            time.sleep(0.1)
+        if _has_checkboxes(wait=1.0):
+            return "checkbox-list"
 
         if dd.find_elements(By.CSS_SELECTOR, "input[inputmode='numeric'], input[type='number']"):
+            # если чекбоксы подгружаются с задержкой, даём им шанс проявиться
+            if _has_checkboxes(wait=0.6):
+                return "checkbox-list"
             return "numeric"
         if dd.find_elements(By.XPATH, ".//input[not(@type='hidden') and not(@readonly) and not(ancestor::*[contains(@class,'ant-select')])]"):
             return "text"
