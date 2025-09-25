@@ -1589,6 +1589,8 @@ def check_report_filters(
             _smoke_filter_ui(anchor, ftype, row_index=row_index)
         except Exception as e:
             _log(f"[COLUMN] {anchor} — filter smoke failed: {type(e).__name__}: {e}", level="WARN")
+        finally:
+            _clear_all_filters_if_present()
 
         processed += 1
         _log(f"[COLUMN] {anchor} — done")
