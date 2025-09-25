@@ -2376,8 +2376,33 @@ def _detect_filter_type():
             texts = [i.get_attribute("value") or "" for i in dd.find_elements(By.CSS_SELECTOR, ".ant-picker .ant-picker-input input")]
             has_time = any(":" in t for t in texts)
             return "datetime" if has_time else "date"
-        if dd.find_elements(By.CSS_SELECTOR, ".ant-checkbox-wrapper, .ant-dropdown-menu-item, .ant-select-item-option"):
-            return "checkbox-list"
+
+        checkbox_selectors = [
+            "input[type='checkbox']",
+            ".ant-checkbox",
+            ".ant-checkbox-wrapper",
+            "[role='menuitemcheckbox']",
+        ]
+
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                if any(dd.find_elements(By.CSS_SELECTOR, sel) for sel in checkbox_selectors):
+                    return "checkbox-list"
+                menu_items = dd.find_elements(By.CSS_SELECTOR, ".ant-dropdown-menu-item")
+                if any(
+                    (item.get_attribute("aria-checked") is not None)
+                    or ((item.get_attribute("role") or "").lower() == "menuitemcheckbox")
+                    for item in menu_items
+                ):
+                    return "checkbox-list"
+            except StaleElementReferenceException:
+                dd = _last_visible_filter(drv, timeout=0.5)
+                if not dd:
+                    break
+                continue
+            time.sleep(0.1)
+
         if dd.find_elements(By.CSS_SELECTOR, "input[inputmode='numeric'], input[type='number']"):
             return "numeric"
         if dd.find_elements(By.XPATH, ".//input[not(@type='hidden') and not(@readonly) and not(ancestor::*[contains(@class,'ant-select')])]"):
