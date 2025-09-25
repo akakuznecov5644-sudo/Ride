@@ -2808,24 +2808,31 @@ def _smoke_filter_ui(anchor: str, ftype: str | None = None, row_index: int = 1):
     4) Здесь НИЧЕГО НЕ ЗАКРЫВАЕМ.
     """
     bi = BuiltIn()
+    drv = _drv()
+
+    # Если фильтр уже открыт (например, его только что открыл вызывающий код),
+    # не трогаем его повторным кликом. Иначе AntD закроет выпадашку и дальнейшие
+    # действия (ввод значения) упадут из-за отсутствующего инпута.
+    reuse_open_filter = _last_visible_filter(drv, timeout=0.2) is not None
 
     # 1) тип без открытия
     t = (ftype or _resolve_filter_type_without_open(anchor) or "").lower()
     if t in ("checkbox-list","checkbox"): t = "multiselect"
     if t == "date": t = "datetime"
 
-    # 2) открыть правильным Open * Filter
-    if t == "text":
-        bi.run_keyword("Open Text Filter", anchor)
-    elif t in ("numeric","number","int","float"):
-        bi.run_keyword("Open Numeric Filter", anchor)
-    elif t in ("datetime","date"):
-        bi.run_keyword("Open DateTime Filter", anchor)
-    elif t == "multiselect":
-        bi.run_keyword("Open Multiselect Filter", anchor)
-    else:
-        _log(f"[SMOKE] '{anchor}': unknown type '{t}', fallback Open Text Filter", level="WARN")
-        bi.run_keyword("Open Text Filter", anchor)
+    # 2) открыть правильным Open * Filter, только если дропдаун ещё не открыт
+    if not reuse_open_filter:
+        if t == "text":
+            bi.run_keyword("Open Text Filter", anchor)
+        elif t in ("numeric","number","int","float"):
+            bi.run_keyword("Open Numeric Filter", anchor)
+        elif t in ("datetime","date"):
+            bi.run_keyword("Open DateTime Filter", anchor)
+        elif t == "multiselect":
+            bi.run_keyword("Open Multiselect Filter", anchor)
+        else:
+            _log(f"[SMOKE] '{anchor}': unknown type '{t}', fallback Open Text Filter", level="WARN")
+            bi.run_keyword("Open Text Filter", anchor)
 
     # 3) выполнить профильную ветку (внутри открытого фильтра)
     if t == "text":
