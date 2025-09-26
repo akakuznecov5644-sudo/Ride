@@ -3017,12 +3017,104 @@ def _run_multiselect_filter_smoke(anchor: str, row_index: int = 1):
     idx = _header_index_by_title(anchor) if not _is_attr_pair(str(anchor)) else _header_index_by_title(str(anchor))
     sample = _pick_cell_value(idx, row_index=row_index)
     if not sample:
-        _log(f"[MULTISELECT] '{anchor}': no sample in table", level="WARN")
-        return
-    BuiltIn().run_keyword("Click By Text On Filter", str(sample))
+        picked = _pick_first_multiselect_option()
+        if not picked:
+            _log(f"[MULTISELECT] '{anchor}': no sample in table and dropdown has no selectable options", level="WARN")
+            return
+        text, attr = picked
+        _log(f"[MULTISELECT] '{anchor}': fallback to first option → {text}")
+        if attr:
+            BuiltIn().run_keyword("Click By Attr On Filter", attr)
+        else:
+            BuiltIn().run_keyword("Click By Text On Filter", text)
+    else:
+        BuiltIn().run_keyword("Click By Text On Filter", str(sample))
     ok = BuiltIn().run_keyword_and_return_status("Click By Text On Filter", "OK", "timeout=2")
     if not ok:
         BuiltIn().run_keyword("Click By Text On Filter", "Apply", "timeout=2")
+
+
+def _pick_first_multiselect_option() -> tuple[str, str | None] | None:
+    """Возвращает (text, attr_pair) для первой доступной опции мультиселекта."""
+    drv = _drv()
+    dd = _last_visible_filter(drv, timeout=0.7)
+    if not dd:
+        return None
+
+    skip_tokens = {
+        "select all",
+        "clear",
+        "clear all",
+        "reset",
+        "search",
+        "no data",
+        "none",
+    }
+
+    def _sanitize(text: str | None) -> str | None:
+        val = _norm(text or "")
+        if not val:
+            return None
+        low = val.lower()
+        if low in skip_tokens:
+            return None
+        return val
+
+    def _pick_from_nodes(nodes, *, prefer_attr: bool) -> tuple[str, str | None] | None:
+        for node in nodes:
+            try:
+                cls = (node.get_attribute("class") or "").lower()
+            except Exception:
+                cls = ""
+            if "disabled" in cls:
+                continue
+            if not _visible(node):
+                continue
+            text = None
+            try:
+                text = _sanitize(node.text or node.get_attribute("textContent") or "")
+            except Exception:
+                text = None
+            if not text:
+                continue
+            if prefer_attr:
+                try:
+                    val = node.get_attribute("data-menu-id")
+                except Exception:
+                    val = None
+                if val:
+                    return text, f'data-menu-id="{val}"'
+            return text, None
+        return None
+
+    # 1) Предпочтительно пункты с data-menu-id
+    try:
+        nodes = dd.find_elements(By.CSS_SELECTOR, "*[data-menu-id]")
+    except Exception:
+        nodes = []
+    picked = _pick_from_nodes(nodes, prefer_attr=True)
+    if picked:
+        return picked
+
+    # 2) Фолбэк: label с чекбоксами
+    try:
+        nodes = dd.find_elements(By.XPATH, ".//label[.//input[@type='checkbox' and not(@disabled)]]")
+    except Exception:
+        nodes = []
+    picked = _pick_from_nodes(nodes, prefer_attr=False)
+    if picked:
+        return picked
+
+    # 3) Ещё один фолбэк: элементы-опции по роли
+    try:
+        nodes = dd.find_elements(By.CSS_SELECTOR, "*[role='option'], *[role='menuitem']")
+    except Exception:
+        nodes = []
+    picked = _pick_from_nodes(nodes, prefer_attr=False)
+    if picked:
+        return picked
+
+    return None
 
 def _open_filters_by_order(order_list, *, allow_fallback_clicks: bool = False, timeout: float = 8.0):
     """Prewarm filters (compat stub): основной цикл сам проходит по всем колонкам."""
