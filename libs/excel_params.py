@@ -39,6 +39,14 @@ def _class_token_pred(val: str) -> str:
         [f"contains(concat(' ', normalize-space(@class), ' '), ' {t} ')" for t in tokens]
     ) or "false()"
 
+def _xp_literal(s: str) -> str:
+    # безопасная строковая константа для XPath
+    if '"' not in s:
+        return f'"{s}"'
+    if "'" not in s:
+        return f"'{s}'"
+    parts = s.split('"')
+    return "concat(" + ", '\"', ".join([f'"{p}"' for p in parts]) + ")"
 
 def _dbg(msg: str):
     """INFO‑лог + screenshot c порядковым номером."""
@@ -438,7 +446,8 @@ def click_by_attr(attr_pair: str,
     css = f'[{attr}*="{val}"]'
     locator = f'css:{css}'
     if index:
-        locator = f'xpath:(({css}))[{index}]'
+        val_esc = val.replace('"', '\\"')
+        locator = f'xpath:(//*[contains(@{attr}, "{val_esc}")])[{index}]'
 
     sl = BuiltIn().get_library_instance("SeleniumLibrary")
     drv = sl.driver
@@ -711,7 +720,7 @@ def searchable_select_by_attr(attr_pair: str,
 
 @keyword("Wait Until Page Has")
 def wait_until_page_has(locator: str,
-                        timeout: str = "10 s",
+                        timeout: str = "20 s",
                         error: str | None = None):
     """
     INFO‑лог + оригинальный Wait Until Page Contains Element.
@@ -3119,3 +3128,2257 @@ def _pick_first_multiselect_option() -> tuple[str, str | None] | None:
 def _open_filters_by_order(order_list, *, allow_fallback_clicks: bool = False, timeout: float = 8.0):
     """Prewarm filters (compat stub): основной цикл сам проходит по всем колонкам."""
     return
+    
+    
+@keyword("Click Row Action By Login")
+def click_row_action_by_login(
+    search_col: str,
+    search_value: str,
+    click_col: str,
+    click_text: str = "",
+    table_index: int = 1,
+    exact_search: bool = True,
+    headers_exact: bool = False,  # оставлен для совместимости; фильтрация заголовков — строгое совпадение
+    timeout: int = 15,
+):
+    drv = _drv()
+    _log(
+        f"[ROW-ACTION] search_col='{search_col}', value='{search_value}', "
+        f"click_col='{click_col}', click_text='{click_text}', "
+        f"table_index={table_index}, exact_search={exact_search}, headers_exact={headers_exact}, timeout={timeout}"
+    )
+
+    # ---------------- helpers ----------------
+    def _norm(s: str) -> str:
+        # Строгое совпадение по регистру, нормализуем только пробелы
+        return " ".join((s or "").split())
+
+    def _is_empty_click_text(s: str) -> bool:
+        t = _norm(s)
+        return t in ("", '""', "''")
+
+    def _xpath_literal(s: str) -> str:
+        if "'" not in s:
+            return f"'{s}'"
+        if '"' not in s:
+            return f'"{s}"'
+        parts = s.split("'")
+        return "concat(" + ", \"'\", ".join([f"'{p}'" for p in parts]) + ")"
+
+    def _headers_text(container):
+        ths = container.find_elements(By.XPATH, ".//thead//th[not(contains(@class,'ant-table-cell-scrollbar'))]")
+        out = []
+        for th in ths:
+            txt = (th.text or "").strip()
+            if not txt:
+                txt = (th.get_attribute("title") or th.get_attribute("aria-label") or "").strip()
+            out.append(txt)
+        return out
+
+    def _index_of_header_exact(headers_text, target) -> int:
+        t = _norm(target)
+        for i, h in enumerate(headers_text, 1):
+            if _norm(h) == t:
+                return i
+        return -1
+
+    def _has_any_rows_quick(container) -> bool:
+        # Быстрый не-блокирующий тест наличия строк
+        if container.find_elements(By.XPATH, ".//div[contains(@class,'ant-table-row')]"):
+            return True
+        if container.find_elements(By.XPATH, ".//tbody/tr[not(contains(@class,'ant-table-placeholder'))]"):
+            return True
+        return False
+
+    def _collect_rows(container):
+        rows_div = container.find_elements(By.XPATH, ".//div[contains(@class,'ant-table-row')]")
+        if rows_div:
+            return rows_div, "div"
+        rows_tr = container.find_elements(By.XPATH, ".//tbody/tr[not(contains(@class,'ant-table-placeholder'))]")
+        return rows_tr, "tr"
+
+    def _cells(row):
+        # Поддержка td и виртуальных div.ant-table-cell
+        return row.find_elements(By.XPATH, "./td | ./div[contains(@class,'ant-table-cell')]")
+
+    # ---------------- containers (strict) ----------------
+    def _collect_containers_strict():
+        union = (
+            "(//div[contains(@class,'ant-table-container')]"
+            " | //div[contains(@class,'ant-table-wrapper')]//div[contains(@class,'ant-table')]"
+            " | //div[contains(@class,'ant-table')][.//table])"
+        )
+        # 1) дождёмся хотя бы одну таблицу в корне
+        WebDriverWait(drv, timeout).until(EC.presence_of_element_located((By.XPATH, union)))
+        raw = drv.find_elements(By.XPATH, union)
+
+        # дедуп и только видимые
+        seen = set()
+        base = []
+        for el in raw:
+            if el.id in seen:
+                continue
+            seen.add(el.id)
+            try:
+                if el.is_displayed():
+                    base.append(el)
+            except Exception:
+                continue
+
+        strict = []
+        for c in base:
+            try:
+                # должна быть таблица (header/body структура уже отрисована)
+                if not c.find_elements(By.XPATH, ".//table"):
+                    continue
+                hdrs = _headers_text(c)
+                sc_idx = _index_of_header_exact(hdrs, search_col)
+                cc_idx = _index_of_header_exact(hdrs, click_col)
+                if sc_idx == -1 or cc_idx == -1:
+                    continue
+                # и уже должны присутствовать строки (исключаем «header-only» контейнеры)
+                if not _has_any_rows_quick(c):
+                    continue
+                strict.append(c)
+            except Exception:
+                continue
+
+        if strict:
+            _log(f"[ROW-ACTION] strict containers (root): {len(strict)}")
+            return strict
+
+        # 2) если в корне не нашли — проверим iframe'ы (контекст останется внутри найденного iframe)
+        iframes = drv.find_elements(By.TAG_NAME, "iframe")
+        _log(f"[ROW-ACTION] no strict in root; probing {len(iframes)} iframes", level="WARN")
+        for idx, fr in enumerate(iframes, 1):
+            try:
+                drv.switch_to.frame(fr)
+                WebDriverWait(drv, 2).until(EC.presence_of_element_located((By.XPATH, union)))
+                raw_if = drv.find_elements(By.XPATH, union)
+                seen_if = set()
+                base_if = []
+                for el in raw_if:
+                    if el.id in seen_if:
+                        continue
+                    seen_if.add(el.id)
+                    if el.is_displayed():
+                        base_if.append(el)
+
+                strict_if = []
+                for c in base_if:
+                    if not c.find_elements(By.XPATH, ".//table"):
+                        continue
+                    hdrs = _headers_text(c)
+                    sc_idx = _index_of_header_exact(hdrs, search_col)
+                    cc_idx = _index_of_header_exact(hdrs, click_col)
+                    if sc_idx == -1 or cc_idx == -1:
+                        continue
+                    if not _has_any_rows_quick(c):
+                        continue
+                    strict_if.append(c)
+
+                if strict_if:
+                    _log(f"[ROW-ACTION] strict containers (iframe #{idx}): {len(strict_if)}")
+                    return strict_if
+                drv.switch_to.default_content()
+            except Exception:
+                drv.switch_to.default_content()
+                continue
+
+        drv.switch_to.default_content()
+        return []
+
+    # ---------------- try on one container ----------------
+    def _try_on_container(container, idx: int) -> bool:
+        _log(f"[ROW-ACTION] probing strict container #{idx}")
+        # явное ожидание строк (уже после строгой фильтрации это коротко)
+        row_union = ".//tbody/tr[not(contains(@class,'ant-table-placeholder'))] | .//div[contains(@class,'ant-table-row')]"
+        WebDriverWait(container, timeout).until(EC.presence_of_element_located((By.XPATH, row_union)))
+
+        hdrs = _headers_text(container)
+        sc_idx = _index_of_header_exact(hdrs, search_col)
+        cc_idx = _index_of_header_exact(hdrs, click_col)
+        if sc_idx == -1 or cc_idx == -1:
+            _log(f"[ROW-ACTION] container #{idx}: headers mismatch (strict). headers={hdrs}", level="WARN")
+            return False
+
+        rows, _ = _collect_rows(container)
+        if not rows:
+            _log(f"[ROW-ACTION] container #{idx}: нет строк", level="WARN")
+            return False
+
+        # поиск строки
+        target_row = None
+        sv_norm = _norm(search_value)
+        sv_cf = sv_norm.casefold()
+        for r in rows:
+            cells = _cells(r)
+            if len(cells) < max(sc_idx, cc_idx):
+                continue
+            cell_search = cells[sc_idx - 1]
+            txt = _norm(cell_search.text)
+            ok = (txt == sv_norm) if exact_search else (sv_cf in txt.casefold())
+            if ok:
+                target_row = r
+                break
+
+        if target_row is None:
+            _log(f"[ROW-ACTION] container #{idx}: строка '{search_value}' не найдена в '{search_col}'", level="WARN")
+            return False
+
+        # целевая ячейка и клик
+        click_cell = _cells(target_row)[cc_idx - 1]
+        try:
+            drv.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", click_cell)
+        except Exception:
+            pass
+
+        if not _is_empty_click_text(click_text):
+            t = _norm(click_text)
+            lit = _xpath_literal(t)
+            cand = click_cell.find_elements(By.XPATH, f".//*[normalize-space(text()) = {lit}]")
+            if not cand:
+                cand = click_cell.find_elements(By.XPATH, f".//*[contains(normalize-space(text()), {lit})]")
+            if not cand:
+                _log(f"[ROW-ACTION] container #{idx}: в ячейке нет элемента с текстом '{click_text}'", level="WARN")
+                return False
+            el = cand[0]
+            WebDriverWait(drv, timeout).until(EC.element_to_be_clickable(el))
+            try:
+                el.click()
+            except Exception:
+                drv.execute_script("arguments[0].click();", el)
+            _log(f"[ROW-ACTION] container #{idx}: клик по '{click_text}' — OK")
+            return True
+
+        # фолбэки
+        selectors = [
+            ".//label[contains(@class,'ant-checkbox-wrapper')]",
+            ".//span[contains(@class,'ant-checkbox')]",
+            ".//*[@role='switch']",
+            ".//button[not(@disabled)]",
+            ".//a[normalize-space(string(.))!='']",
+        ]
+        target = None
+        for xp in selectors:
+            got = click_cell.find_elements(By.XPATH, xp)
+            if got:
+                target = got[0]
+                break
+
+        if target is None:
+            _log(f"[ROW-ACTION] container #{idx}: нет интерактива в '{click_col}'", level="WARN")
+            return False
+
+        WebDriverWait(drv, timeout).until(EC.element_to_be_clickable(target))
+        try:
+            target.click()
+        except Exception:
+            drv.execute_script("arguments[0].click();", target)
+        _log(f"[ROW-ACTION] container #{idx}: клик — OK")
+        return True
+
+    # ---------------- main ----------------
+    containers = _collect_containers_strict()
+    total = len(containers)
+    if total == 0:
+        # диагностируем, какие шапки вообще видны
+        union_all = (
+            "(//div[contains(@class,'ant-table-container')]"
+            " | //div[contains(@class,'ant-table-wrapper')]//div[contains(@class,'ant-table')]"
+            " | //div[contains(@class,'ant-table')][.//table])"
+        )
+        visible = [el for el in drv.find_elements(By.XPATH, union_all) if el.is_displayed()]
+        seen_headers = []
+        for el in visible:
+            try:
+                seen_headers.append(_headers_text(el))
+            except Exception:
+                continue
+        raise AssertionError(
+            "Нет видимых таблиц с требуемыми столбцами (строгое совпадение и наличие строк). "
+            f"Искали: [{_norm(search_col)}] и [{_norm(click_col)}]. "
+            f"Видимые шапки: {seen_headers}"
+        )
+
+    _log(f"[ROW-ACTION] strict containers matched (with rows): {total}")
+
+    # приоритетный индекс в пределах отфильтрованного списка (DOM-порядок сохранён)
+    start_idx = table_index if isinstance(table_index, int) and 1 <= table_index <= total else 1
+    tried = set([start_idx])
+
+    try:
+        if _try_on_container(containers[start_idx - 1], start_idx):
+            return
+    except Exception as e:
+        _log(f"[ROW-ACTION] container #{start_idx} exception: {type(e).__name__}: {e}", level="WARN")
+
+    for i in range(1, total + 1):
+        if i in tried:
+            continue
+        try:
+            if _try_on_container(containers[i - 1], i):
+                return
+        except Exception as e:
+            _log(f"[ROW-ACTION] container #{i} exception: {type(e).__name__}: {e}", level="WARN")
+
+    raise AssertionError(f"Не удалось выполнить клик ни в одной из {total} подходящих таблиц (strict headers).")
+
+
+
+@keyword("Logpass")
+def logpass(login: str, password: str, timeout: int = 20):
+    """
+    Ввод логина и пароля и сабмит формы.
+    Robot:  Logpass    <логин>    <пароль>
+    """
+    drv = _drv()
+    start_ts = time.time()
+    _log(f"[LOGPASS] login='{login}', timeout={timeout}")
+
+    # Кандидаты локаторов
+    user_xp = [
+        "//input[(@name='login' or @id='login' or @autocomplete='username') and not(@type='hidden')]",
+        "//input[(@name='username' or @id='username' or @type='email') and not(@type='hidden')]",
+        "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'login') and not(@type='hidden')]",
+        "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'username') and not(@type='hidden')]",
+        "(//input[@type='text' or @type='email'])[1]",
+    ]
+    pass_xp = [
+        "//input[@type='password' and not(@disabled)]",
+        "//input[(@name='password' or @id='password' or @autocomplete='current-password') and not(@type='hidden')]",
+        "//input[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'password') and not(@type='hidden')]",
+    ]
+
+    def _find_pair_in_context(ctx):
+        usr_el = None
+        pwd_el = None
+        # Ищем username
+        for xp in user_xp:
+            try:
+                nodes = ctx.find_elements(By.XPATH, xp)
+            except Exception:
+                nodes = []
+            for n in nodes:
+                try:
+                    if _visible(n) and n.is_enabled():
+                        usr_el = n
+                        break
+                except Exception:
+                    continue
+            if usr_el:
+                break
+        # Ищем password
+        for xp in pass_xp:
+            try:
+                nodes = ctx.find_elements(By.XPATH, xp)
+            except Exception:
+                nodes = []
+            for n in nodes:
+                try:
+                    if _visible(n) and n.is_enabled():
+                        pwd_el = n
+                        break
+                except Exception:
+                    continue
+            if pwd_el:
+                break
+        return usr_el, pwd_el
+
+    # 1) Пытаемся найти поля в корне
+    username, password_el = None, None
+    while time.time() - start_ts < timeout / 2:
+        username, password_el = _find_pair_in_context(drv)
+        if username and password_el:
+            break
+        time.sleep(0.25)
+
+    # 2) Если не нашли — пробуем каждый iframe
+    if not (username and password_el):
+        frames = drv.find_elements(By.TAG_NAME, "iframe")
+        for fr in frames:
+            try:
+                drv.switch_to.frame(fr)
+                t0 = time.time()
+                while time.time() - t0 < 6:
+                    username, password_el = _find_pair_in_context(drv)
+                    if username and password_el:
+                        _log("[LOGPASS] fields found in iframe")
+                        break
+                    time.sleep(0.25)
+                if username and password_el:
+                    break
+            except Exception:
+                pass
+            finally:
+                try:
+                    drv.switch_to.default_content()
+                except Exception:
+                    pass
+
+    if not (username and password_el):
+        raise AssertionError("[LOGPASS] Не нашёл видимые поля логина/пароля")
+
+    # Ввод логина
+    try:
+        _scroll_el_into_view(username)
+        username.click()
+    except Exception:
+        pass
+    try:
+        username.clear()
+    except Exception:
+        pass
+    try:
+        drv.execute_script(
+            "if(arguments[0].readOnly!==true){arguments[0].value='';"
+            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));}", username)
+    except Exception:
+        pass
+    username.send_keys(_norm(login))
+
+    # Ввод пароля
+    try:
+        _scroll_el_into_view(password_el)
+        password_el.click()
+    except Exception:
+        pass
+    try:
+        password_el.clear()
+    except Exception:
+        pass
+    try:
+        drv.execute_script(
+            "if(arguments[0].readOnly!==true){arguments[0].value='';"
+            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));}", password_el)
+    except Exception:
+        pass
+    password_el.send_keys(password)
+
+    # Поиск кнопки submit (сначала в ближайшей форме)
+    submit_btn = None
+    form = None
+    try:
+        forms = password_el.find_elements(By.XPATH, "ancestor::form[1]")
+        if forms:
+            form = forms[0]
+            # Кнопка внутри формы
+            for xp in [
+                ".//button[@type='submit' and not(@disabled)]",
+                ".//input[@type='submit' and not(@disabled)]",
+                ".//button[normalize-space(.)='Login' or normalize-space(.)='Sign in' or normalize-space(.)='Войти']",
+                ".//button[.//span[normalize-space(.)='Login' or normalize-space(.)='Sign in' or normalize-space(.)='Войти']]",
+            ]:
+                try:
+                    btns = form.find_elements(By.XPATH, xp)
+                except Exception:
+                    btns = []
+                for b in btns:
+                    if _visible(b) and b.is_enabled():
+                        submit_btn = b
+                        break
+                if submit_btn:
+                    break
+    except Exception:
+        pass
+
+    # Глобальный поиск, если в форме не нашли
+    if submit_btn is None:
+        for xp in [
+            "//button[@type='submit' and not(@disabled)]",
+            "//input[@type='submit' and not(@disabled)]",
+            "//button[normalize-space(.)='Login' or normalize-space(.)='Sign in' or normalize-space(.)='Войти']",
+            "//button[.//span[normalize-space(.)='Login' or normalize-space(.)='Sign in' or normalize-space(.)='Войти']]",
+        ]:
+            try:
+                btns = drv.find_elements(By.XPATH, xp)
+            except Exception:
+                btns = []
+            for b in btns:
+                if _visible(b) and b.is_enabled():
+                    submit_btn = b
+                    break
+            if submit_btn:
+                break
+
+    # Сабмит
+    if submit_btn is not None:
+        try:
+            _scroll_el_into_view(submit_btn)
+            WebDriverWait(drv, 5).until(EC.element_to_be_clickable(submit_btn))
+            submit_btn.click()
+        except Exception:
+            drv.execute_script("arguments[0].click();", submit_btn)
+        _log("[LOGPASS] submit button clicked")
+        return True
+
+    # Если кнопки нет — submit через форму/Enter
+    if form is not None:
+        try:
+            drv.execute_script("arguments[0].submit();", form)
+            _log("[LOGPASS] form.submit()")
+            return True
+        except Exception:
+            pass
+
+    try:
+        password_el.submit()
+        _log("[LOGPASS] input.submit()")
+        return True
+    except Exception:
+        pass
+
+    # Крайний случай — Enter по паролю
+    drv.execute_script(
+        "var e=new KeyboardEvent('keydown',{key:'Enter',keyCode:13,which:13,bubbles:true});"
+        "arguments[0].dispatchEvent(e);", password_el)
+    _log("[LOGPASS] dispatched Enter")
+    return True
+
+
+@keyword("Wait For AntD Notification")
+def wait_for_antd_notification(text: str,
+                               timeout: str = "5 s",
+                               exact: bool = True,
+                               position: str = "topRight"):
+    """
+    Wait For AntD Notification    Access is allowed    6 s
+    """
+    drv = _drv()
+    try:
+        drv.switch_to.default_content()
+    except Exception:
+        pass
+
+    # парсинг таймаута "5 s" / "500 ms" / "2 min" / 7
+    t = str(timeout).strip().lower().replace(" ", "")
+    if t.endswith("ms"):
+        timeout_secs = float(t[:-2]) / 1000.0
+    elif t.endswith("min"):
+        timeout_secs = float(t[:-3]) * 60.0
+    elif t.endswith("m"):
+        timeout_secs = float(t[:-1]) * 60.0
+    elif t.endswith("s"):
+        timeout_secs = float(t[:-1])
+    else:
+        timeout_secs = float(t)
+
+    txt = text.strip()
+    pos_css = f".ant-notification.ant-notification-{position}" if position else ".ant-notification"
+
+    js_check = """
+return (function(txt, exact, posSel){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const stacks = document.querySelectorAll(posSel);
+  for (const stack of stacks){
+    const msgs = stack.querySelectorAll("div.ant-notification-notice-message");
+    for (const m of msgs){
+      const t = norm(m.textContent);
+      if ((exact && t === txt) || (!exact && t.includes(txt))) return true;
+    }
+  }
+  return false;
+})(arguments[0], arguments[1], arguments[2]);
+"""
+
+    _log(f"[ANTD-NOTICE] wait appear: '{txt}', exact={exact}, pos={position}, timeout={timeout}")
+    WebDriverWait(drv, timeout_secs, poll_frequency=0.1).until(
+        lambda d: d.execute_script(js_check, txt, bool(exact), pos_css) is True
+    )
+    return True
+
+
+
+@keyword("Delete GLMs Where IOC Not Zero")
+def delete_glms_where_ioc_not_zero(timeout: int = 300, table_index: int | None = None):
+    """
+    Удаляет ВСЕ GLM в таблице, где столбец IOC != '0'.
+    - Столбцы: Actions / IOC / GLM (классами ячеек либо по тексту шапки)
+    - Для каждой подходящей строки: кликает Delete -> подтверждает Yes (ant-popconfirm)
+    - Ждёт тост: "GLM <GLM>(IOC <IOC>) deleted successfully"
+    Делает многократные ПОЛНЫЕ проходы: сверху-вниз со скроллом; если были удаления — снова вверх и заново.
+    """
+    drv = _drv()
+    end_overall = time.time() + float(timeout)
+
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    # --- 1) Найти нужную таблицу ---
+    def _headers_text(container):
+        ths = container.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+        return [_norm(th.text) for th in ths]
+
+    containers = drv.find_elements(By.CSS_SELECTOR, "div.ant-table-container")
+    targets = []
+    for c in containers:
+        try:
+            if not c.is_displayed():
+                continue
+            hdrs = set(_headers_text(c))
+            if {"Actions", "IOC", "GLM"}.issubset(hdrs):
+                targets.append(c)
+        except Exception:
+            continue
+    if not targets:
+        raise AssertionError("[GLM-DEL] Не нашёл видимую таблицу с заголовками Actions/IOC/GLM")
+
+    table = targets[0] if not table_index else targets[table_index - 1]
+
+    # тело (может отсутствовать как отдельный скролл-контейнер)
+    try:
+        body = table.find_element(By.CSS_SELECTOR, "div.ant-table-body")
+    except Exception:
+        body = table
+
+    # --- 2) Хелперы прокрутки и поиска кандидата ---
+    js_find_candidate = """
+return (function(container){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const rows = container.querySelectorAll('tbody tr.ant-table-row, div.ant-table-row');
+  for (const row of rows){
+    const iocCell = row.querySelector('td.IOC, div.IOC, td[class*="IOC"], div[class*="IOC"]');
+    if(!iocCell) continue;
+    const ioc = norm(iocCell.textContent);
+    if(!ioc || /^0+(\\.0+)?$/.test(ioc)) continue;
+    const act = row.querySelector('td.ACTIONS, div.ACTIONS, [class*="ACTIONS"]');
+    if(!act) continue;
+    let del = Array.from(act.querySelectorAll('a,button')).find(e => norm(e.textContent).toLowerCase() === 'delete');
+    if(!del) continue;
+    const glmCell = row.querySelector('td.GLM, div.GLM, [class*="GLM"]');
+    const glm = norm(glmCell ? glmCell.textContent : '');
+    return [del, ioc, glm];
+  }
+  return null;
+})(arguments[0]);
+"""
+
+    def _scroll_to_top():
+        try:
+            drv.execute_script("arguments[0].scrollTop = 0;", body)
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+    def _scroll_step_down() -> bool:
+        """Скроллит вниз на ~1 экран. Возвращает True, если позиция увеличилась."""
+        try:
+            cur = drv.execute_script("return arguments[0].scrollTop;", body)
+            ch = drv.execute_script("return arguments[0].clientHeight;", body)
+            sh = drv.execute_script("return arguments[0].scrollHeight;", body)
+            new_top = min(cur + (ch * 0.9), sh)
+            drv.execute_script("arguments[0].scrollTop = arguments[0];", new_top)
+            time.sleep(0.15)
+            cur2 = drv.execute_script("return arguments[0].scrollTop;", body)
+            return cur2 > cur + 1
+        except Exception:
+            # контейнер не скроллится
+            return False
+
+    def _wait_toast_exact(msg_text: str, sec: float = 10.0):
+        drv.switch_to.default_content()
+        js_check = """
+return (function(txt){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const stacks = document.querySelectorAll(".ant-notification");
+  for (const s of stacks){
+    const msgs = s.querySelectorAll("div.ant-notification-notice-message");
+    for (const m of msgs){
+      if (norm(m.textContent) === norm(txt)) return true;
+    }
+  }
+  return false;
+})(arguments[0]);
+"""
+        WebDriverWait(drv, sec, poll_frequency=0.1).until(
+            lambda d: d.execute_script(js_check, msg_text) is True
+        )
+
+    # --- 3) Главный цикл: полные проходы, пока есть удаления ---
+    total_deleted = 0
+    pass_num = 0
+
+    while time.time() < end_overall:
+        pass_num += 1
+        deleted_this_pass = 0
+        _log(f"[GLM-DEL] PASS #{pass_num}: старт сверху")
+
+        _scroll_to_top()
+
+        reached_bottom = False
+        while time.time() < end_overall and not reached_bottom:
+            candidate = None
+            try:
+                candidate = drv.execute_script(js_find_candidate, body)
+            except Exception:
+                candidate = None
+
+            if candidate:
+                del_el, ioc_val, glm_val = candidate
+                ioc_val = _norm(ioc_val)
+                glm_val = _norm(glm_val)
+                # если GLM пуст — прокрутимся и продолжим (не наш кандидат)
+                if not glm_val:
+                    _ = _scroll_step_down()
+                    continue
+
+                msg_text = f"GLM {glm_val}(IOC {ioc_val}) deleted successfully"
+                _log(f"[GLM-DEL] PASS #{pass_num}: delete GLM={glm_val}, IOC={ioc_val}")
+
+                try:
+                    drv.execute_script("arguments[0].scrollIntoView({block:'center'});", del_el)
+                except Exception:
+                    pass
+                try:
+                    del_el.click()
+                except Exception:
+                    drv.execute_script("arguments[0].click();", del_el)
+
+                # подтверждение Yes
+                drv.switch_to.default_content()
+                yes_btn = WebDriverWait(drv, 6, poll_frequency=0.1).until(
+                    EC.element_to_be_clickable((By.XPATH, "//div[contains(@class,'ant-popconfirm')]//button[.//span[normalize-space()='Yes']]"))
+                )
+                try:
+                    yes_btn.click()
+                except Exception:
+                    drv.execute_script("arguments[0].click();", yes_btn)
+
+                # ждём тост
+                _wait_toast_exact(msg_text, sec=10.0)
+
+                deleted_this_pass += 1
+                total_deleted += 1
+                _log(f"[GLM-DEL] PASS #{pass_num}: удалено {deleted_this_pass} (сумма {total_deleted})")
+
+                # маленькая пауза на перерисовку
+                time.sleep(0.2)
+                # НЕ скроллим — пытаемся удалить ещё в текущем вьюпорте
+                continue
+
+            # кандидата нет в текущем экране — шагаем вниз
+            moved = _scroll_step_down()
+            if not moved:
+                reached_bottom = True
+
+        if deleted_this_pass == 0:
+            _log(f"[GLM-DEL] PASS #{pass_num}: кандидатов не найдено — завершение. Всего удалено: {total_deleted}")
+            return total_deleted
+
+        # были удаления — делаем ещё один полный проход (сверху), вдруг остались выше
+        _log(f"[GLM-DEL] PASS #{pass_num}: удалено {deleted_this_pass}, начинаю следующий проход")
+
+    _log(f"[GLM-DEL] Таймаут: всего удалено {total_deleted}")
+    return total_deleted
+    
+@keyword("Delete Non-Zero IOCs")
+def delete_non_zero_iocs(timeout: int = 300, table_index: int | None = None):
+    """
+    Удаляет ВСЕ IOC, у которых в столбце IOC значение != '0'.
+    Алгоритм:
+      1) Находит видимую AntD-таблицу с колонкой IOC.
+      2) Делает полный проход сверху вниз (со скроллом) и собирает уникальные значения IOC != '0'.
+      3) Для каждого такого значения:
+         - жмёт кнопку "Delete IOC" на тулбаре таблицы,
+         - в модалке открывает селект IOC, выбирает нужное число, жмёт OK,
+         - ждёт тост "IOC <N> deleted successfully".
+      4) Повторяет, пока значения IOC != '0' не закончатся, либо не истечёт timeout.
+    Возвращает количество удалённых IOC.
+    """
+    drv = _drv()
+    end_overall = time.time() + float(timeout)
+
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    # --- 1) Найти нужную таблицу (видимую) ---
+    containers = drv.find_elements(By.CSS_SELECTOR, "div.ant-table-container")
+    targets = []
+    for c in containers:
+        try:
+            if not c.is_displayed():
+                continue
+            # таблица должна иметь колонку IOC в шапке
+            th_ioc = c.find_elements(By.CSS_SELECTOR, ".ant-table-header th.IOC, .ant-table-header th[aria-label='IOC']")
+            if th_ioc:
+                targets.append(c)
+        except Exception:
+            continue
+    if not targets:
+        raise AssertionError("[IOC-DEL] Не нашёл видимую таблицу с колонкой IOC")
+
+    table = targets[0] if not table_index else targets[table_index - 1]
+
+    # родительский .ant-table (для тулбара "Delete IOC")
+    table_root = table.find_element(By.XPATH, "./ancestor::div[contains(@class,'ant-table')][1]")
+
+    # тело (может быть как отдельный скролл-контейнер)
+    try:
+        body = table.find_element(By.CSS_SELECTOR, "div.ant-table-body")
+    except Exception:
+        body = table
+
+    # --- 2) Хелперы прокрутки, сбора IOC и ожидания тостов ---
+    def _scroll_to_top():
+        try:
+            drv.execute_script("arguments[0].scrollTop = 0;", body)
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+    def _scroll_step_down() -> bool:
+        """Скроллит вниз на ~1 экран. Возвращает True, если позиция увеличилась."""
+        try:
+            cur = drv.execute_script("return arguments[0].scrollTop;", body)
+            ch  = drv.execute_script("return arguments[0].clientHeight;", body)
+            sh  = drv.execute_script("return arguments[0].scrollHeight;", body)
+            new_top = min(cur + (ch * 0.9), sh)
+            drv.execute_script("arguments[0].scrollTop = arguments[1];", body, new_top)
+            time.sleep(0.15)
+            cur2 = drv.execute_script("return arguments[0].scrollTop;", body)
+            return cur2 > cur + 1
+        except Exception:
+            return False
+
+    js_collect_nonzero_iocs = """
+return (function(container){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const out = new Set();
+  const rows = container.querySelectorAll('tbody tr.ant-table-row, tr.ant-table-row');
+  for (const r of rows){
+    const cell = r.querySelector('td.IOC, div.IOC, td[aria-label="IOC"], td[class*="IOC"]');
+    if(!cell) continue;
+    const v = norm(cell.textContent);
+    if (v && v !== '0') out.add(v);
+  }
+  return Array.from(out);
+})(arguments[0]);
+"""
+
+    def _collect_all_nonzero_iocs() -> list[str]:
+        _scroll_to_top()
+        found = set()
+        reached_bottom = False
+        while not reached_bottom and time.time() < end_overall:
+            try:
+                vals = drv.execute_script(js_collect_nonzero_iocs, body) or []
+                for v in vals:
+                    if v and v != '0':
+                        found.add(_norm(v))
+            except Exception:
+                pass
+            moved = _scroll_step_down()
+            if not moved:
+                reached_bottom = True
+        return sorted(found, key=lambda x: int(x) if x.isdigit() else x)
+
+    def _wait_toast_exact(msg_text: str, sec: float = 10.0):
+        # AntD-notification живёт в document.body вне корней приложения
+        try:
+            drv.switch_to.default_content()
+        except Exception:
+            pass
+        js_check = """
+return (function(txt){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const stacks = document.querySelectorAll(".ant-notification");
+  for (const s of stacks){
+    const msgs = s.querySelectorAll("div.ant-notification-notice-message");
+    for (const m of msgs){
+      if (norm(m.textContent) === norm(txt)) return true;
+    }
+  }
+  return false;
+})(arguments[0]);
+"""
+        WebDriverWait(drv, sec, poll_frequency=0.1).until(
+            lambda d: d.execute_script(js_check, msg_text) is True
+        )
+
+    def _click(elem):
+        try:
+            elem.click()
+        except Exception:
+            try:
+                drv.execute_script("arguments[0].click();", elem)
+            except Exception:
+                raise
+
+    # --- 3) Главный цикл: пока остаются IOC != '0' ---
+    total_deleted = 0
+    pass_num = 0
+
+    while time.time() < end_overall:
+        pass_num += 1
+        _log(f"[IOC-DEL] PASS #{pass_num}: собираю значения IOC != 0")
+        nonzero_iocs = _collect_all_nonzero_iocs()
+        if not nonzero_iocs:
+            _log(f"[IOC-DEL] PASS #{pass_num}: кандидатов нет — завершение. Удалено: {total_deleted}")
+            return total_deleted
+
+        _log(f"[IOC-DEL] PASS #{pass_num}: найдено {len(nonzero_iocs)} значений: {', '.join(nonzero_iocs)}")
+
+        for ioc_val in nonzero_iocs:
+            if time.time() >= end_overall:
+                break
+
+            # Кнопка Delete IOC в тулбаре таблицы
+            delete_btn = WebDriverWait(table_root, 10, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-table-title')]//button[.//span[normalize-space()='Delete IOC']]"))
+            )
+            try:
+                drv.execute_script("arguments[0].scrollIntoView({block:'center'});", delete_btn)
+            except Exception:
+                pass
+            _click(delete_btn)
+
+            # Модалка "Delete IOC"
+            modal = WebDriverWait(drv, 10, poll_frequency=0.1).until(
+                EC.visibility_of_element_located((By.XPATH, "//div[contains(@class,'ant-modal')][.//div[contains(@class,'ant-modal-title') and normalize-space()='Delete IOC']]"))
+            )
+
+            # Открыть селект IOC
+            selector = WebDriverWait(modal, 5, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//label[@for='ioc']/following::div[contains(@class,'ant-select')][1]//div[contains(@class,'ant-select-selector')]"))
+            )
+            _click(selector)
+
+            # Выбрать нужное значение в выпадающем списке
+            # Кликаем по опции с точным текстом ioc_val
+            opt = WebDriverWait(drv, 10, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, f"//div[contains(@class,'ant-select-dropdown')]//div[contains(@class,'ant-select-item-option-content')][normalize-space()='{ioc_val}']"))
+            )
+            _click(opt)
+
+            # Нажать OK
+            ok_btn = WebDriverWait(modal, 5, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-modal-footer')]//button[.//span[normalize-space()='OK']]"))
+            )
+            _click(ok_btn)
+
+            # Ждём тост
+            toast_text = f"IOC {ioc_val} deleted successfully"
+            _wait_toast_exact(toast_text, sec=12.0)
+
+            total_deleted += 1
+            _log(f"[IOC-DEL] Удалён IOC={ioc_val} (итого {total_deleted})")
+            time.sleep(0.2)  # дать DOM перерисоваться
+
+        # после прохода повторяем сбор — вдруг остались новые/проскролленные значения
+        _log(f"[IOC-DEL] PASS #{pass_num}: завершён, всего удалено {total_deleted}; проверяю ещё раз")
+
+    _log(f"[IOC-DEL] Таймаут по общей операции. Всего удалено {total_deleted}")
+    return total_deleted
+
+
+@keyword("Add IOC")
+def add_ioc(count: int = 1, timeout: int = 300, table_index: int | None = None):
+    """
+    Add IOC    <count>
+    Логика на каждую итерацию:
+      - Находит max(IOC) в таблице.
+      - Нажимает "Add IOC" → подтверждает в окне "OK".
+      - Ждёт тост "IOC N added successfully".
+      - Проверяет, что в таблице появилась строка с IOC == max_before + 1.
+      - Сравнивает N из тоста с (max_before + 1). Иначе — AssertionError.
+    Возвращает число успешно добавленных.
+    """
+    drv = _drv()
+    end_overall = time.time() + float(timeout)
+    total_done = 0
+
+    # ---------- локаторы и базовые операции ----------
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    def _click(el):
+        try:
+            el.click()
+        except Exception:
+            drv.execute_script("arguments[0].click();", el)
+
+    # ищем таблицу с колонкой IOC (видимую). Если несколько — table_index (1-based)
+    def _find_table():
+        containers = drv.find_elements(By.CSS_SELECTOR, "div.ant-table-container")
+        matches = []
+        for c in containers:
+            try:
+                if not c.is_displayed():
+                    continue
+                ths = c.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+                headers = [_norm(th.text) for th in ths]
+                if "IOC" in headers:
+                    matches.append((c, headers))
+            except Exception:
+                continue
+        if not matches:
+            raise AssertionError("[ADD-IOC] Не нашёл видимую таблицу с колонкой 'IOC'")
+        if table_index:
+            idx = table_index - 1
+            if idx < 0 or idx >= len(matches):
+                raise AssertionError(f"[ADD-IOC] table_index={table_index} вне диапазона (найдено {len(matches)} таблиц)")
+            return matches[idx][0], matches[idx][1]
+        return matches[0][0], matches[0][1]
+
+    table, headers = _find_table()
+    # тело скролла (если нет — работаем по самому контейнеру)
+    try:
+        body = table.find_element(By.CSS_SELECTOR, "div.ant-table-body")
+    except Exception:
+        body = table
+
+    # тулбар текущей таблицы для кнопки Add IOC
+    table_root = table.find_element(By.XPATH, "./ancestor::div[contains(@class,'ant-table')][1]")
+
+    # ---------- скролл и обход строк ----------
+    def _scroll_to_top():
+        try:
+            drv.execute_script("arguments[0].scrollTop = 0;", body)
+            time.sleep(0.12)
+        except Exception:
+            pass
+
+    def _scroll_step_down() -> bool:
+        try:
+            cur = drv.execute_script("return arguments[0].scrollTop;", body)
+            # мгновенно в самый низ
+            drv.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", body)
+            time.sleep(0.06)
+            cur2 = drv.execute_script("return arguments[0].scrollTop;", body)
+            return cur2 > cur + 1
+        except Exception:
+            return False
+
+    # берём индекс столбца IOC из шапки (fallback, если нет классов ячеек)
+    def _ioc_col_index() -> int:
+        try:
+            ths = table.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+            for i, th in enumerate(ths):
+                if _norm(th.text) == "IOC":
+                    return i
+        except Exception:
+            pass
+        return -1
+
+    ioc_idx = _ioc_col_index()
+
+    # макс. IOC по всей таблице (со скроллом)
+    def _get_max_ioc() -> int:
+        _scroll_to_top()
+        max_val = None
+        while True:
+            try:
+                if ioc_idx >= 0:
+                    # по индексу колонки
+                    rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+                    for r in rows:
+                        tds = r.find_elements(By.CSS_SELECTOR, "td")
+                        if ioc_idx < len(tds):
+                            v = _norm(tds[ioc_idx].text)
+                            if v.isdigit():
+                                val = int(v)
+                                max_val = val if max_val is None or val > max_val else max_val
+                else:
+                    # по классам/атрибутам
+                    cells = body.find_elements(By.CSS_SELECTOR, "td.IOC, td[aria-label='IOC'], td[class*='IOC']")
+                    for c in cells:
+                        v = _norm(c.text)
+                        if v.isdigit():
+                            val = int(v)
+                            max_val = val if max_val is None or val > max_val else max_val
+            except Exception:
+                pass
+            if not _scroll_step_down():
+                break
+        return 0 if max_val is None else max_val
+
+    # поиск строки с конкретным числом IOC (со скроллом; true/false)
+    def _table_has_ioc(target: int, sec: float = 12.0) -> bool:
+        dead = time.time() + sec
+        while time.time() < dead:
+            _scroll_to_top()
+            found = False
+            while True:
+                try:
+                    if ioc_idx >= 0:
+                        rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+                        for r in rows:
+                            tds = r.find_elements(By.CSS_SELECTOR, "td")
+                            if ioc_idx < len(tds) and _norm(tds[ioc_idx].text) == str(target):
+                                found = True
+                                break
+                    else:
+                        cells = body.find_elements(By.CSS_SELECTOR, "td.IOC, td[aria-label='IOC'], td[class*='IOC']")
+                        for c in cells:
+                            if _norm(c.text) == str(target):
+                                found = True
+                                break
+                except Exception:
+                    pass
+                if found:
+                    return True
+                if not _scroll_step_down():
+                    break
+            time.sleep(0.2)
+        return False
+
+    # ожидание тоста "IOC N added successfully" (возвращает N как int)
+    def _wait_added_toast(expected: int | None, sec: float = 15.0) -> int:
+        try:
+            drv.switch_to.default_content()
+        except Exception:
+            pass
+        expected_text = f"IOC {expected} added successfully" if expected is not None else None
+
+        js_find_toast = """
+return (function(expectedTxt){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const stacks = document.querySelectorAll('.ant-notification');
+  let last = null;
+  for (const s of stacks){
+    const msgs = s.querySelectorAll('div.ant-notification-notice-message');
+    for (const m of msgs){
+      const t = norm(m.textContent);
+      if (t.endsWith('added successfully') && t.startsWith('IOC ')){
+        if (expectedTxt && t === expectedTxt) return t;
+        // если expectedTxt не задан — вернём первый подходящий
+        if (!expectedTxt) last = t;
+      }
+    }
+  }
+  return expectedTxt ? null : last;
+})(arguments[0]);
+"""
+        deadline = time.time() + sec
+        while time.time() < deadline:
+            try:
+                t = drv.execute_script(js_find_toast, expected_text)
+            except Exception:
+                t = None
+            if t:
+                # парсим число
+                try:
+                    n = int(t.split(" ")[1])
+                    return n
+                except Exception:
+                    raise AssertionError(f"[ADD-IOC] Некорректный формат тоста: {t}")
+            time.sleep(0.1)
+        raise AssertionError(f"[ADD-IOC] Не дождался тоста 'IOC {expected} added successfully'")
+
+    # найти кнопку Add IOC в тулбаре текущей таблицы
+    def _find_add_button():
+        return WebDriverWait(table_root, 10, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-table-title')]//button[.//span[normalize-space()='Add IOC']]"))
+        )
+
+    # подтвердить OK в модалке/поповере
+    def _confirm_ok():
+        try:
+            drv.switch_to.default_content()
+        except Exception:
+            pass
+        # ждём модалку или поповер
+        container = WebDriverWait(drv, 8, poll_frequency=0.1).until(
+            lambda d: next((m for m in d.find_elements(By.XPATH, "//div[contains(@class,'ant-modal') and .//div[contains(@class,'ant-modal-title')]]") if m.is_displayed()), None)
+            or next((p for p in d.find_elements(By.XPATH, "//div[contains(@class,'ant-popconfirm')]") if p.is_displayed()), None)
+        )
+        # кнопка OK/Yes
+        try:
+            ok = WebDriverWait(container, 5, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//button[.//span[normalize-space()='OK' or normalize-space()='Yes']]"))
+            )
+        except Exception:
+            ok = WebDriverWait(container, 3, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//button[contains(@class,'ant-btn-primary')]"))
+            )
+        _click(ok)
+        # ждём закрытия окна
+        WebDriverWait(drv, 8, poll_frequency=0.1).until(EC.invisibility_of_element(container))
+
+    # ---------- основной цикл ----------
+    for i in range(int(max(0, count))):
+        if time.time() >= end_overall:
+            _log(f"[ADD-IOC] Общий таймаут. Выполнено {total_done} из {count}")
+            break
+
+        # 1) базовый максимум
+        base_max = _get_max_ioc()
+        expected = base_max + 1
+        _log(f"[ADD-IOC] Итерация {i+1}/{count}: текущий max(IOC)={base_max}, ожидаю новый={expected}")
+
+        # 2) Add IOC
+        add_btn = _find_add_button()
+        try:
+            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", add_btn)
+        except Exception:
+            pass
+        _click(add_btn)
+        _confirm_ok()
+
+        # 3) ждём тост про добавление именно ожидаемого числа
+        toast_num = _wait_added_toast(expected, sec=20.0)
+        _log(f"[ADD-IOC] Тост получен: IOC {toast_num} added successfully")
+
+        # 4) проверяем появление строки с expected
+        if not _table_has_ioc(expected, sec=20.0):
+            raise AssertionError(f"[ADD-IOC] В таблице не появилась строка с IOC={expected} после добавления")
+
+        # 5) сравнение чисел
+        if toast_num != expected:
+            raise AssertionError(f"[ADD-IOC] Несоответствие чисел: тост={toast_num}, ожидалось={expected}")
+
+        total_done += 1
+        _log(f"[ADD-IOC] Итерация {i+1}: OK (IOC={expected}). Всего выполнено: {total_done}")
+        time.sleep(0.25)  # дать DOM успокоиться
+
+    return total_done
+    
+@keyword("Add GLM")
+def add_glm(count: int = 1, timeout: int = 600, table_index: int | None = None):
+    """
+    Add GLM    <count>
+    Для каждого IOC != 0 добавляет GLM указанное количество раз, проверяя тост
+    'GLM N(IOC M) added successfully' и появление строки (IOC=M, GLM=N) в таблице.
+    """
+    drv = _drv()
+    end_overall = time.time() + float(timeout)
+    total_done = 0
+
+    # -------- utils --------
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    def _click(el):
+        try:
+            el.click()
+        except Exception:
+            drv.execute_script("arguments[0].click();", el)
+
+    # -------- таблица/тело/шапки --------
+    def _find_table():
+        containers = drv.find_elements(By.CSS_SELECTOR, "div.ant-table-container")
+        matches = []
+        for c in containers:
+            try:
+                if not c.is_displayed():
+                    continue
+                ths = c.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+                headers = [_norm(th.text) for th in ths]
+                if "IOC" in headers:
+                    matches.append((c, headers))
+            except Exception:
+                continue
+        if not matches:
+            raise AssertionError("[ADD-GLM] Не нашёл видимую таблицу с колонкой 'IOC'")
+        if table_index:
+            i = table_index - 1
+            if i < 0 or i >= len(matches):
+                raise AssertionError(f"[ADD-GLM] table_index={table_index} вне диапазона (найдено {len(matches)} таблиц)")
+            return matches[i][0], matches[i][1]
+        return matches[0][0], matches[0][1]
+
+    table, headers = _find_table()
+    try:
+        body = table.find_element(By.CSS_SELECTOR, "div.ant-table-body")
+    except Exception:
+        body = table
+
+    table_root = table.find_element(By.XPATH, "./ancestor::div[contains(@class,'ant-table')][1]")
+
+    def _col_index(name: str) -> int:
+        try:
+            ths = table.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+            for i, th in enumerate(ths):
+                if _norm(th.text) == name:
+                    return i
+        except Exception:
+            pass
+        return -1
+
+    ioc_idx  = _col_index("IOC")
+    glm_idx  = _col_index("GLM")
+    ucode_idx = _col_index("Unique Code")
+
+    # -------- скролл --------
+    def _scroll_to_top():
+        try:
+            drv.execute_script("arguments[0].scrollTop = 0;", body)
+            time.sleep(0.12)
+        except Exception:
+            pass
+
+    def _scroll_step_down() -> bool:
+        try:
+            cur = drv.execute_script("return arguments[0].scrollTop;", body)
+            # мгновенно в самый низ
+            drv.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", body)
+            time.sleep(0.06)
+            cur2 = drv.execute_script("return arguments[0].scrollTop;", body)
+            return cur2 > cur + 1
+        except Exception:
+            return False
+
+    # -------- чтение таблицы --------
+    def _collect_nonzero_iocs() -> list[str]:
+        _scroll_to_top()
+        found = set()
+        while True:
+            try:
+                if ioc_idx >= 0:
+                    rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+                    for r in rows:
+                        tds = r.find_elements(By.CSS_SELECTOR, "td")
+                        if ioc_idx < len(tds):
+                            v = _norm(tds[ioc_idx].text)
+                            if v and v != "0":
+                                found.add(v)
+                else:
+                    cells = body.find_elements(By.CSS_SELECTOR, "td.IOC, td[aria-label='IOC'], td[class*='IOC']")
+                    for c in cells:
+                        v = _norm(c.text)
+                        if v and v != "0":
+                            found.add(v)
+            except Exception:
+                pass
+            if not _scroll_step_down():
+                break
+        return sorted(found, key=lambda x: (not x.isdigit(), int(x) if x.isdigit() else x))
+
+    def _get_max_glm_for_ioc(ioc_val: str) -> int | None:
+        _scroll_to_top()
+        max_val = None
+        while True:
+            try:
+                rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+                for r in rows:
+                    # фильтр по IOC
+                    ioc_ok = False
+                    if ioc_idx >= 0:
+                        tds = r.find_elements(By.CSS_SELECTOR, "td")
+                        if ioc_idx < len(tds) and _norm(tds[ioc_idx].text) == ioc_val:
+                            ioc_ok = True
+                    else:
+                        cell = None
+                        for sel in ("td.IOC", "td[aria-label='IOC']", "td[class*='IOC']"):
+                            try:
+                                cell = r.find_element(By.CSS_SELECTOR, sel)
+                                break
+                            except Exception:
+                                continue
+                        if cell is not None and _norm(cell.text) == ioc_val:
+                            ioc_ok = True
+                    if not ioc_ok:
+                        continue
+                    # читаем GLM
+                    v = ""
+                    if glm_idx >= 0:
+                        tds = r.find_elements(By.CSS_SELECTOR, "td")
+                        if glm_idx < len(tds):
+                            v = _norm(tds[glm_idx].text)
+                    else:
+                        cell = None
+                        for sel in ("td.GLM", "td[aria-label='GLM']", "td[class*='GLM']"):
+                            try:
+                                cell = r.find_element(By.CSS_SELECTOR, sel)
+                                break
+                            except Exception:
+                                continue
+                        v = _norm(cell.text) if cell else ""
+                    if v.isdigit():
+                        val = int(v)
+                        max_val = val if max_val is None or val > max_val else max_val
+            except Exception:
+                pass
+            if not _scroll_step_down():
+                break
+        return max_val
+
+    def _table_has_pair(ioc_val: str, glm_val: int, sec: float = 20.0) -> bool:
+        deadline = time.time() + sec
+        target_glm = str(glm_val)
+        while time.time() < deadline:
+            _scroll_to_top()
+            found = False
+            while True:
+                try:
+                    rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+                    for r in rows:
+                        # IOC
+                        ioc_text = ""
+                        if ioc_idx >= 0:
+                            tds = r.find_elements(By.CSS_SELECTOR, "td")
+                            if ioc_idx < len(tds):
+                                ioc_text = _norm(tds[ioc_idx].text)
+                        else:
+                            try:
+                                ioc_text = _norm(r.find_element(By.CSS_SELECTOR, "td.IOC, td[aria-label='IOC'], td[class*='IOC']").text)
+                            except Exception:
+                                ioc_text = ""
+                        if ioc_text != ioc_val:
+                            continue
+                        # GLM
+                        glm_text = ""
+                        if glm_idx >= 0:
+                            tds = r.find_elements(By.CSS_SELECTOR, "td")
+                            if glm_idx < len(tds):
+                                glm_text = _norm(tds[glm_idx].text)
+                        else:
+                            try:
+                                glm_text = _norm(r.find_element(By.CSS_SELECTOR, "td.GLM, td[aria-label='GLM'], td[class*='GLM']").text)
+                            except Exception:
+                                glm_text = ""
+                        if glm_text == target_glm:
+                            found = True
+                            break
+                except Exception:
+                    pass
+                if found:
+                    return True
+                if not _scroll_step_down():
+                    break
+            time.sleep(0.2)
+        return False
+
+    def _collect_all_unique_codes() -> set[str]:
+        if ucode_idx < 0:
+            return set()
+        s = set()
+        _scroll_to_top()
+        while True:
+            try:
+                rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+                for r in rows:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if ucode_idx < len(tds):
+                        v = _norm(tds[ucode_idx].text)
+                        if v:
+                            s.add(v)
+            except Exception:
+                pass
+            if not _scroll_step_down():
+                break
+        return s
+
+    # -------- генераторы --------
+    seq = 0
+    def _gen_unique_code(existing: set[str]) -> str:
+        base = int(time.time() * 100) % 1_000_000
+        candidate = str(base)
+        while candidate in existing:
+            base += 1
+            candidate = str(base)
+        return candidate
+
+    def _gen_certificate_id() -> str:
+        nonlocal seq
+        seq += 1
+        return f"{int(time.time()*1000)}{seq%1000:03d}"
+
+    # -------- UI: кнопка/модалка/дропдауны/тост --------
+    def _find_add_glm_button():
+        try:
+            return WebDriverWait(table_root, 4, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-table-title')]//button[.//span[normalize-space()='Add GLM']]"))
+            )
+        except Exception:
+            return WebDriverWait(drv, 2, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[.//span[normalize-space()='Add GLM']]"))
+            )
+
+    # открыть селект по label[@for=...] и вернуть ПАНЕЛЬ дропдауна
+    def _open_dropdown_for_label(modal, for_id: str):
+        sel = WebDriverWait(modal, 4, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, f".//label[@for='{for_id}']/following::div[contains(@class,'ant-select')][1]//div[contains(@class,'ant-select-selector')]"))
+        )
+        try:
+            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", sel)
+        except Exception:
+            pass
+        _click(sel)
+        # 1) пробуем по id панели: "{for}_list"
+        try:
+            return WebDriverWait(drv, 2, poll_frequency=0.1).until(
+                EC.visibility_of_element_located((By.ID, f"{for_id}_list"))
+            )
+        except Exception:
+            # 2) фолбэк — последний видимый dropdown
+            return WebDriverWait(drv, 4, poll_frequency=0.1).until(
+                EC.visibility_of_element_located((By.XPATH, "(//div[contains(@class,'ant-select-dropdown') and not(contains(@style,'display: none'))])[last()]"))
+            )
+
+    # выбрать точный текст в виртуализированном списке с автоскроллом панели
+    def _dropdown_select_exact(panel, text: str, timeout: float = 10.0):
+        end = time.time() + float(timeout)
+        js_try_match = """
+return (function(root, target){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const nodes = root.querySelectorAll("div.ant-select-item-option-content");
+  for (const n of nodes){
+    if (norm(n.textContent) === norm(target)) return n;
+  }
+  return null;
+})(arguments[0], arguments[1]);
+"""
+        try:
+            holder = drv.execute_script("return arguments[0].closest('.ant-select-dropdown')?.querySelector('.rc-virtual-list-holder')", panel)
+        except Exception:
+            holder = None
+        if holder is None:
+            holder = panel
+
+        # попытка сразу
+        node = drv.execute_script(js_try_match, panel, text)
+        if node:
+            drv.execute_script("arguments[0].click();", node)
+            return
+
+        # скроллим вниз порциями, проверяя появление цели
+        last_top = -1
+        while time.time() < end:
+            node = drv.execute_script(js_try_match, panel, text)
+            if node:
+                drv.execute_script("arguments[0].click();", node)
+                return
+            try:
+                cur  = drv.execute_script("return arguments[0].scrollTop;", holder)
+                maxh = drv.execute_script("return arguments[0].scrollHeight - arguments[0].clientHeight;", holder)
+            except Exception:
+                cur, maxh = 0, 0
+            if maxh <= 0 or cur >= maxh or cur == last_top:
+                break
+            drv.execute_script("arguments[0].scrollTop = Math.min(arguments[0].scrollTop + arguments[0].clientHeight*0.9, arguments[0].scrollHeight);", holder)
+            last_top = cur
+            time.sleep(0.08)
+
+        # финальная попытка: проскроллить в самый верх и ещё раз проверить
+        try:
+            drv.execute_script("arguments[0].scrollTop = 0;", holder)
+            time.sleep(0.05)
+            node = drv.execute_script(js_try_match, panel, text)
+            if node:
+                drv.execute_script("arguments[0].click();", node)
+                return
+        except Exception:
+            pass
+
+        raise AssertionError(f"[ADD-GLM] Не нашёл опцию в дропдауне: {text}")
+
+    def _dropdown_select_first(panel):
+        opt = WebDriverWait(panel, 4, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-select-item-option') and not(contains(@class,'-disabled'))][1]"))
+        )
+        _click(opt)
+
+    def _fill_modal_and_submit(ioc_val: str, unique_code: str, certificate_id: str):
+        modal = WebDriverWait(drv, 4, poll_frequency=0.1).until(
+            EC.visibility_of_element_located((By.XPATH, "//div[contains(@class,'ant-modal')][.//div[contains(@class,'ant-modal-title') and normalize-space()='Add GLM']]"))
+        )
+
+        # IOC: нужный номер (≠0)
+        ioc_panel = _open_dropdown_for_label(modal, "ioc")
+        _dropdown_select_exact(ioc_panel, ioc_val)
+
+        # Location: первая опция
+        loc_panel = _open_dropdown_for_label(modal, "location_id")
+        _dropdown_select_first(loc_panel)
+
+        # Unique Code (числовой ant-input-number)
+        uinp = WebDriverWait(modal, 4, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "input#unique_code.ant-input-number-input"))
+        )
+        try:
+            uinp.clear()
+        except Exception:
+            pass
+        uinp.send_keys(unique_code)
+
+        # Certificate (текст)
+        cinp = WebDriverWait(modal, 4, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "input#certificate"))
+        )
+        try:
+            cinp.clear()
+        except Exception:
+            pass
+        cinp.send_keys(certificate_id)
+
+        # OK
+        ok_btn = WebDriverWait(modal, 4, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-modal-footer')]//button[.//span[normalize-space()='OK']]"))
+        )
+        _click(ok_btn)
+        WebDriverWait(drv, 4, poll_frequency=0.1).until(EC.invisibility_of_element(modal))
+
+    def _wait_glm_added_toast(expected_ioc: str, expected_glm: int, sec: float = 20.0):
+        try:
+            drv.switch_to.default_content()
+        except Exception:
+            pass
+        js_find = """
+return (function(){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const stacks = document.querySelectorAll('.ant-notification');
+  for (const s of stacks){
+    const msgs = s.querySelectorAll('div.ant-notification-notice-message');
+    for (const m of msgs){
+      const t = norm(m.textContent);
+      if (/^GLM \\d+\\(IOC \\d+\\) added successfully$/.test(t)) return t;
+    }
+  }
+  return null;
+})();
+"""
+        deadline = time.time() + sec
+        while time.time() < deadline:
+            t = None
+            try:
+                t = drv.execute_script(js_find)
+            except Exception:
+                pass
+            if t:
+                try:
+                    p1 = t.find("GLM ") + 4
+                    p2 = t.find("(", p1)
+                    n = int(t[p1:p2])
+                    q1 = t.find("IOC ", p2) + 4
+                    q2 = t.find(")", q1)
+                    m = t[q1:q2]
+                except Exception:
+                    raise AssertionError(f"[ADD-GLM] Некорректный формат тоста: {t}")
+
+                if str(m) != str(expected_ioc):
+                    raise AssertionError(f"[ADD-GLM] Тост IOC={m}, ожидалось IOC={expected_ioc}")
+                if n != int(expected_glm):
+                    raise AssertionError(f"[ADD-GLM] Тост GLM={n}, ожидалось GLM={expected_glm}")
+                return (n, m)
+            time.sleep(0.1)
+        raise AssertionError(f"[ADD-GLM] Не дождался тоста 'GLM {expected_glm}(IOC {expected_ioc}) added successfully'")
+
+    # -------- основной цикл --------
+    ioc_list = _collect_nonzero_iocs()
+    if not ioc_list:
+        _log("[ADD-GLM] На странице нет IOC != 0 — делать нечего")
+        return 0
+
+    _log(f"[ADD-GLM] Целевые IOC: {', '.join(ioc_list)}; на каждого по {count} добавлений")
+
+    for ioc_val in ioc_list:
+        for rep in range(int(max(0, count))):
+            if time.time() >= end_overall:
+                _log(f"[ADD-GLM] Общий таймаут. Выполнено {total_done}")
+                return total_done
+
+            cur_max = _get_max_glm_for_ioc(ioc_val)
+            expected_glm = 0 if cur_max is None else cur_max + 1
+            _log(f"[ADD-GLM] IOC={ioc_val} итерация {rep+1}/{count}: cur_max={cur_max}, ожидаю GLM={expected_glm}")
+
+            existing_ucodes = _collect_all_unique_codes()
+            ucode = _gen_unique_code(existing_ucodes)
+            cert  = _gen_certificate_id()
+
+            btn = _find_add_glm_button()
+            try:
+                drv.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            except Exception:
+                pass
+            _click(btn)
+
+            _fill_modal_and_submit(ioc_val=ioc_val, unique_code=ucode, certificate_id=cert)
+
+            toast_glm, toast_ioc = _wait_glm_added_toast(expected_ioc=ioc_val, expected_glm=expected_glm, sec=20.0)
+            _log(f"[ADD-GLM] Тост: GLM={toast_glm}, IOC={toast_ioc}")
+
+            if not _table_has_pair(ioc_val=ioc_val, glm_val=expected_glm, sec=20.0):
+                raise AssertionError(f"[ADD-GLM] В таблице не появилась строка IOC={ioc_val}, GLM={expected_glm}")
+
+            total_done += 1
+            _log(f"[ADD-GLM] OK: IOC={ioc_val}, GLM={expected_glm}. Всего добавлено: {total_done}")
+            time.sleep(0.25)
+
+    return total_done
+
+
+
+@keyword("Expect Error")
+def expect_error(expected_message: str, timeout: int = 30):
+    """
+    Expect Error    <expected_message>    [timeout=30]
+    Ждёт появление AntD-уведомления с точным текстом <expected_message>.
+    Возвращает фактический текст уведомления.
+    """
+    drv = _drv()
+    target = " ".join((expected_message or "").split())
+    end = time.time() + float(timeout)
+
+    try:
+        drv.switch_to.default_content()
+    except Exception:
+        pass
+
+    js = """
+return (function(expected){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const tgt = norm(expected);
+  // Ищем во всех стеках AntD notifications
+  const roots = document.querySelectorAll('.ant-notification');
+  for (const root of roots){
+    const nodes = root.querySelectorAll(
+      '.ant-notification-notice-message, .ant-notification-notice-description'
+    );
+    for (const n of nodes){
+      const t = norm(n.textContent);
+      if (t === tgt) return t;
+    }
+  }
+  return null;
+})(arguments[0]);
+"""
+
+    while time.time() < end:
+        try:
+            txt = drv.execute_script(js, target)
+        except Exception:
+            txt = None
+        if txt:
+            _log(f"[EXPECT-ERROR] Найдено уведомление: {txt}")
+            return txt
+        time.sleep(0.1)
+
+    raise AssertionError(f"[EXPECT-ERROR] Не дождался уведомления: {expected_message!r} за {timeout}s")
+    
+@keyword("Add GLM With Existing Unique Code")
+def add_glm_with_existing_unique_code(ioc: str | None = None,
+                                      timeout: float = 30.0,
+                                      table_index: int | None = None):
+    """
+    Берёт любой непустой Unique Code из таблицы и пытается создать GLM с ним (дубликат).
+    Certificate генерируется уникальный, чтобы сработала именно ошибка по Unique Code.
+    Ошибку ловит внешний кейворд Expect Error.
+    """
+    drv = _drv()
+    bi  = BuiltIn()
+
+    # ---------- утилиты (локально, чтобы не плодить глобальные def) ----------
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    def _click(el):
+        try:
+            el.click()
+        except Exception:
+            drv.execute_script("arguments[0].click();", el)
+
+    def _find_table():
+        boxes = drv.find_elements(By.CSS_SELECTOR, "div.ant-table-container")
+        found = []
+        for c in boxes:
+            try:
+                if not c.is_displayed():
+                    continue
+                ths = c.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+                headers = [_norm(th.text) for th in ths]
+                if "IOC" in headers and "Unique Code" in headers:
+                    found.append((c, headers))
+            except Exception:
+                continue
+        if not found:
+            raise AssertionError("[NEG-GLM-UC] Таблица с колонками 'IOC' и 'Unique Code' не найдена")
+        if table_index:
+            i = table_index - 1
+            if i < 0 or i >= len(found):
+                raise AssertionError(f"[NEG-GLM-UC] table_index={table_index} вне диапазона (найдено {len(found)} таблиц)")
+            return found[i][0], found[i][1]
+        return found[0][0], found[0][1]
+
+    table, headers = _find_table()
+    try:
+        body = table.find_element(By.CSS_SELECTOR, "div.ant-table-body")
+    except Exception:
+        body = table
+    table_root = table.find_element(By.XPATH, "./ancestor::div[contains(@class,'ant-table')][1]")
+
+    def _col_index(name: str) -> int:
+        try:
+            ths = table.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+            for i, th in enumerate(ths):
+                if _norm(th.text) == name:
+                    return i
+        except Exception:
+            pass
+        return -1
+
+    ioc_idx   = _col_index("IOC")
+    ucode_idx = _col_index("Unique Code")
+
+    def _scroll_top():
+        try:
+            drv.execute_script("arguments[0].scrollTop = 0;", body)
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    def _scroll_bottom():
+        try:
+            drv.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", body)
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    def _pick_nonzero_ioc() -> str | None:
+        _scroll_top()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if ioc_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if ioc_idx < len(tds):
+                        val = _norm(tds[ioc_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.IOC, td[class*='IOC']").text)
+                    except Exception:
+                        pass
+                if val and val != "0":
+                    return val
+        except Exception:
+            pass
+        _scroll_bottom()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if ioc_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if ioc_idx < len(tds):
+                        val = _norm(tds[ioc_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.IOC, td[class*='IOC']").text)
+                    except Exception:
+                        pass
+                if val and val != "0":
+                    return val
+        except Exception:
+            pass
+        return None
+
+    def _take_existing_ucode() -> str:
+        # пробуем сверху
+        _scroll_top()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if ucode_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if ucode_idx < len(tds):
+                        val = _norm(tds[ucode_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.UNIQUE_CODE, td[class*='UNIQUE']").text)
+                    except Exception:
+                        pass
+                if val:
+                    return val
+        except Exception:
+            pass
+        # пробуем снизу
+        _scroll_bottom()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if ucode_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if ucode_idx < len(tds):
+                        val = _norm(tds[ucode_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.UNIQUE_CODE, td[class*='UNIQUE']").text)
+                    except Exception:
+                        pass
+                if val:
+                    return val
+        except Exception:
+            pass
+        raise AssertionError("[NEG-GLM-UC] Не нашёл непустой 'Unique Code'")
+
+    # генерация уникального сертификата (чтобы триггерилась именно ошибка UC)
+    seq = 0
+    def _gen_cert() -> str:
+        nonlocal seq
+        seq += 1
+        return f"{int(time.time()*1000)}{seq%1000:03d}"
+
+    def _find_add_glm_btn():
+        try:
+            return WebDriverWait(table_root, 6, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-table-title')]//button[.//span[normalize-space()='Add GLM']]"))
+            )
+        except Exception:
+            return WebDriverWait(drv, 8, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[.//span[normalize-space()='Add GLM']]"))
+            )
+
+    def _open_dropdown_for_label(modal, for_id: str):
+        sel = WebDriverWait(modal, 10, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, f".//label[@for='{for_id}']/following::div[contains(@class,'ant-select')][1]//div[contains(@class,'ant-select-selector')]"))
+        )
+        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", sel)
+        _click(sel)
+        try:
+            return WebDriverWait(drv, 5, poll_frequency=0.1).until(
+                EC.visibility_of_element_located((By.ID, f"{for_id}_list"))
+            )
+        except Exception:
+            return WebDriverWait(drv, 8, poll_frequency=0.1).until(
+                EC.visibility_of_element_located((By.XPATH, "(//div[contains(@class,'ant-select-dropdown') and not(contains(@style,'display: none'))])[last()]"))
+            )
+
+    def _dropdown_select_exact(panel, text: str, timeout_panel: float = 8.0):
+        end = time.time() + float(timeout_panel)
+        js_try = """
+return (function(root, target){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const nodes = root.querySelectorAll("div.ant-select-item-option-content");
+  for (const n of nodes){ if (norm(n.textContent) === norm(target)) return n; }
+  return null;
+})(arguments[0], arguments[1]);
+"""
+        holder = drv.execute_script("return arguments[0].closest('.ant-select-dropdown')?.querySelector('.rc-virtual-list-holder')", panel) or panel
+        node = drv.execute_script(js_try, panel, text)
+        if node:
+            drv.execute_script("arguments[0].click();", node); return
+        # скроллим в конец, потом в начало
+        try:
+            drv.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", holder)
+            time.sleep(0.05)
+            node = drv.execute_script(js_try, panel, text)
+            if node: drv.execute_script("arguments[0].click();", node); return
+            drv.execute_script("arguments[0].scrollTop = 0;", holder)
+            time.sleep(0.05)
+            node = drv.execute_script(js_try, panel, text)
+            if node: drv.execute_script("arguments[0].click();", node); return
+        except Exception:
+            pass
+        raise AssertionError(f"[NEG-GLM-UC] Не нашёл опцию в дропдауне: {text}")
+
+    # ---------- подготовка данных ----------
+    ioc_val = ioc or _pick_nonzero_ioc()
+    if not ioc_val:
+        raise AssertionError("[NEG-GLM-UC] Нет подходящего IOC (≠ 0)")
+
+    exist_uc = _take_existing_ucode()
+    bi.log(f"[NEG-GLM-UC] duplicate UNIQUE_CODE='{exist_uc}', IOC={ioc_val}", "INFO")
+    cert_val = _gen_cert()
+
+    # ---------- UI: Add GLM ----------
+    btn = _find_add_glm_btn()
+    drv.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+    _click(btn)
+
+    modal = WebDriverWait(drv, 12, poll_frequency=0.1).until(
+        EC.visibility_of_element_located((By.XPATH, "//div[contains(@class,'ant-modal')][.//div[contains(@class,'ant-modal-title') and normalize-space()='Add GLM']]"))
+    )
+
+    # IOC
+    ioc_panel = _open_dropdown_for_label(modal, "ioc")
+    _dropdown_select_exact(ioc_panel, ioc_val)
+
+    # Location — первая опция (если требуется)
+    try:
+        loc_panel = _open_dropdown_for_label(modal, "location_id")
+        first_opt = WebDriverWait(loc_panel, 6, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-select-item-option') and not(contains(@class,'-disabled'))][1]"))
+        )
+        _click(first_opt)
+    except Exception:
+        pass
+
+    # Unique Code — ДУБЛИКАТ
+    uinp = WebDriverWait(modal, 8, poll_frequency=0.1).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "input#unique_code.ant-input-number-input"))
+    )
+    try: uinp.clear()
+    except Exception: pass
+    uinp.send_keys(exist_uc)
+
+    # Certificate — уникальный
+    cinp = WebDriverWait(modal, 8, poll_frequency=0.1).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "input#certificate"))
+    )
+    try: cinp.clear()
+    except Exception: pass
+    cinp.send_keys(cert_val)
+
+    # OK (не ждём закрытия модалки — ошибку поймает Expect Error)
+    ok = WebDriverWait(modal, 8, poll_frequency=0.1).until(
+        EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-modal-footer')]//button[.//span[normalize-space()='OK']]"))
+    )
+    _click(ok)
+
+@keyword("Add GLM With Existing Certificate")
+def add_glm_with_existing_certificate(ioc: str | None = None,
+                                      timeout: float = 30.0,
+                                      table_index: int | None = None):
+    """
+    Берёт любой непустой Certificate из таблицы и пытается создать GLM с ним (дубликат).
+    Unique Code генерируется уникальный, чтобы сработала именно ошибка по Certificate.
+    Ошибку ловит внешний кейворд Expect Error.
+    """
+    drv = _drv()
+    bi  = BuiltIn()
+
+    # ---------- утилиты ----------
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    def _click(el):
+        try:
+            el.click()
+        except Exception:
+            drv.execute_script("arguments[0].click();", el)
+
+    def _find_table():
+        boxes = drv.find_elements(By.CSS_SELECTOR, "div.ant-table-container")
+        found = []
+        for c in boxes:
+            try:
+                if not c.is_displayed():
+                    continue
+                ths = c.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+                headers = [_norm(th.text) for th in ths]
+                if "IOC" in headers and "Certificate" in headers:
+                    found.append((c, headers))
+            except Exception:
+                continue
+        if not found:
+            raise AssertionError("[NEG-GLM-CERT] Таблица с колонками 'IOC' и 'Certificate' не найдена")
+        if table_index:
+            i = table_index - 1
+            if i < 0 or i >= len(found):
+                raise AssertionError(f"[NEG-GLM-CERT] table_index={table_index} вне диапазона (найдено {len(found)} таблиц)")
+            return found[i][0], found[i][1]
+        return found[0][0], found[0][1]
+
+    table, headers = _find_table()
+    try:
+        body = table.find_element(By.CSS_SELECTOR, "div.ant-table-body")
+    except Exception:
+        body = table
+    table_root = table.find_element(By.XPATH, "./ancestor::div[contains(@class,'ant-table')][1]")
+
+    def _col_index(name: str) -> int:
+        try:
+            ths = table.find_elements(By.CSS_SELECTOR, ".ant-table-header th")
+            for i, th in enumerate(ths):
+                if _norm(th.text) == name:
+                    return i
+        except Exception:
+            pass
+        return -1
+
+    ioc_idx  = _col_index("IOC")
+    cert_idx = _col_index("Certificate")
+
+    def _scroll_top():
+        try:
+            drv.execute_script("arguments[0].scrollTop = 0;", body)
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    def _scroll_bottom():
+        try:
+            drv.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", body)
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    def _pick_nonzero_ioc() -> str | None:
+        _scroll_top()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if ioc_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if ioc_idx < len(tds):
+                        val = _norm(tds[ioc_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.IOC, td[class*='IOC']").text)
+                    except Exception:
+                        pass
+                if val and val != "0":
+                    return val
+        except Exception:
+            pass
+        _scroll_bottom()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if ioc_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if ioc_idx < len(tds):
+                        val = _norm(tds[ioc_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.IOC, td[class*='IOC']").text)
+                    except Exception:
+                        pass
+                if val and val != "0":
+                    return val
+        except Exception:
+            pass
+        return None
+
+    def _take_existing_cert() -> str:
+        _scroll_top()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if cert_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if cert_idx < len(tds):
+                        val = _norm(tds[cert_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.CERTIFICATE, td[class*='CERTIFICATE']").text)
+                    except Exception:
+                        pass
+                if val:
+                    return val
+        except Exception:
+            pass
+        _scroll_bottom()
+        try:
+            rows = body.find_elements(By.CSS_SELECTOR, "tbody tr.ant-table-row, tbody tr")
+            for r in rows:
+                val = ""
+                if cert_idx >= 0:
+                    tds = r.find_elements(By.CSS_SELECTOR, "td")
+                    if cert_idx < len(tds):
+                        val = _norm(tds[cert_idx].text)
+                if not val:
+                    try:
+                        val = _norm(r.find_element(By.CSS_SELECTOR, "td.CERTIFICATE, td[class*='CERTIFICATE']").text)
+                    except Exception:
+                        pass
+                if val:
+                    return val
+        except Exception:
+            pass
+        raise AssertionError("[NEG-GLM-CERT] Не нашёл непустой 'Certificate'")
+
+    def _gen_ucode() -> str:
+        base = int(time.time()*100) % 1_000_000
+        return str(base)
+
+    def _find_add_glm_btn():
+        try:
+            return WebDriverWait(table_root, 6, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-table-title')]//button[.//span[normalize-space()='Add GLM']]"))
+            )
+        except Exception:
+            return WebDriverWait(drv, 8, poll_frequency=0.1).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[.//span[normalize-space()='Add GLM']]"))
+            )
+
+    def _open_dropdown_for_label(modal, for_id: str):
+        sel = WebDriverWait(modal, 10, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, f".//label[@for='{for_id}']/following::div[contains(@class,'ant-select')][1]//div[contains(@class,'ant-select-selector')]"))
+        )
+        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", sel)
+        _click(sel)
+        try:
+            return WebDriverWait(drv, 5, poll_frequency=0.1).until(
+                EC.visibility_of_element_located((By.ID, f"{for_id}_list"))
+            )
+        except Exception:
+            return WebDriverWait(drv, 8, poll_frequency=0.1).until(
+                EC.visibility_of_element_located((By.XPATH, "(//div[contains(@class,'ant-select-dropdown') and not(contains(@style,'display: none'))])[last()]"))
+            )
+
+    def _dropdown_select_exact(panel, text: str, timeout_panel: float = 8.0):
+        js_try = """
+return (function(root, target){
+  const norm = s => (s||'').replace(/\\s+/g,' ').trim();
+  const nodes = root.querySelectorAll("div.ant-select-item-option-content");
+  for (const n of nodes){ if (norm(n.textContent) === norm(target)) return n; }
+  return null;
+})(arguments[0], arguments[1]);
+"""
+        holder = drv.execute_script("return arguments[0].closest('.ant-select-dropdown')?.querySelector('.rc-virtual-list-holder')", panel) or panel
+        node = drv.execute_script(js_try, panel, text)
+        if node:
+            drv.execute_script("arguments[0].click();", node); return
+        try:
+            drv.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", holder)
+            time.sleep(0.05)
+            node = drv.execute_script(js_try, panel, text)
+            if node: drv.execute_script("arguments[0].click();", node); return
+            drv.execute_script("arguments[0].scrollTop = 0;", holder)
+            time.sleep(0.05)
+            node = drv.execute_script(js_try, panel, text)
+            if node: drv.execute_script("arguments[0].click();", node); return
+        except Exception:
+            pass
+        raise AssertionError(f"[NEG-GLM-CERT] Не нашёл опцию в дропдауне: {text}")
+
+    # ---------- подготовка данных ----------
+    ioc_val = ioc or _pick_nonzero_ioc()
+    if not ioc_val:
+        raise AssertionError("[NEG-GLM-CERT] Нет подходящего IOC (≠ 0)")
+
+    exist_cert = _take_existing_cert()
+    bi.log(f"[NEG-GLM-CERT] duplicate CERTIFICATE='{exist_cert}', IOC={ioc_val}", "INFO")
+    uc_val = _gen_ucode()
+
+    # ---------- UI: Add GLM ----------
+    btn = _find_add_glm_btn()
+    drv.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+    _click(btn)
+
+    modal = WebDriverWait(drv, 12, poll_frequency=0.1).until(
+        EC.visibility_of_element_located((By.XPATH, "//div[contains(@class,'ant-modal')][.//div[contains(@class,'ant-modal-title') and normalize-space()='Add GLM']]"))
+    )
+
+    # IOC
+    ioc_panel = _open_dropdown_for_label(modal, "ioc")
+    _dropdown_select_exact(ioc_panel, ioc_val)
+
+    # Location — первая опция (если требуется)
+    try:
+        loc_panel = _open_dropdown_for_label(modal, "location_id")
+        first_opt = WebDriverWait(loc_panel, 6, poll_frequency=0.1).until(
+            EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-select-item-option') and not(contains(@class,'-disabled'))][1]"))
+        )
+        _click(first_opt)
+    except Exception:
+        pass
+
+    # Unique Code — уникальный
+    uinp = WebDriverWait(modal, 8, poll_frequency=0.1).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "input#unique_code.ant-input-number-input"))
+    )
+    try: uinp.clear()
+    except Exception: pass
+    uinp.send_keys(uc_val)
+
+    # Certificate — ДУБЛИКАТ
+    cinp = WebDriverWait(modal, 8, poll_frequency=0.1).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "input#certificate"))
+    )
+    try: cinp.clear()
+    except Exception: pass
+    cinp.send_keys(exist_cert)
+
+    # OK (ошибку ловит Expect Error)
+    ok = WebDriverWait(modal, 8, poll_frequency=0.1).until(
+        EC.element_to_be_clickable((By.XPATH, ".//div[contains(@class,'ant-modal-footer')]//button[.//span[normalize-space()='OK']]"))
+    )
+    _click(ok)
