@@ -52,7 +52,7 @@ Create Jackpot Lucky Chance Fixed Prize
     Open Jackpot Create Form
     Fill By Attr    id="code_desc"    ${jp_name}
     Select By Attr    id="progressive_type"    Lucky Chance
-    Select By Attr    id="lc_progressive_contribution"    Fixed Prize
+    Click Switch By Text    Fixed Prize
     Select By Attr    id="currency_code"    EUR
     Fill By Attr    id="min_bet_amount"    1
     Fill By Attr    id="max_bet_amount"    100
@@ -67,7 +67,7 @@ Create Jackpot Lucky Chance Progressive
     Open Jackpot Create Form
     Fill By Attr    id="code_desc"    ${jp_name}
     Select By Attr    id="progressive_type"    Lucky Chance
-    Select By Attr    id="lc_progressive_contribution"    Progressive
+    Click Switch By Text    Progressive
     Select By Attr    id="currency_code"    EUR
     Fill By Attr    id="jackpot_reset_amount"    50
     Fill By Attr    id="max_jackpot_amount"    100000
