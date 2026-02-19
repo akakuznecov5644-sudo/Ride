@@ -554,6 +554,45 @@ def click_by_text(
         drv.execute_script("arguments[0].click();", target)
 
 
+@keyword("Click Switch By Text")
+def click_switch_by_text(text: str,
+                         timeout: float = 8.0,
+                         *,
+                         js_fallback: bool = True):
+    """
+    Кликает по текстовому переключателю (segmented / tabs-like / radio-like),
+    который часто используется вместо стандартного ant-select.
+
+    Примеры:
+        Click Switch By Text    Fixed Prize
+        Click Switch By Text    Progressive
+    """
+    BuiltIn().log(f"Clicking switch element with text \"{text}\"", "INFO")
+    drv = BuiltIn().get_library_instance("SeleniumLibrary").driver
+
+    # Один способ поиска: кликабельный пункт переключателя в модалке по точному тексту.
+    xpath = (
+        "//div[contains(@class,'ant-modal-content')]"
+        "//*[contains(@class,'ant-segmented-item') or contains(@class,'ant-radio-button-wrapper') "
+        "or contains(@class,'ant-btn') or @role='button' or self::button or self::label or self::span or self::div]"
+        f"[normalize-space(.)='{text}']"
+    )
+
+    target = WebDriverWait(drv, timeout).until(
+        EC.element_to_be_clickable((By.XPATH, xpath))
+    )
+
+    try:
+        target.click()
+    except Exception:
+        if not js_fallback:
+            raise
+        drv.execute_script(
+            "arguments[0].scrollIntoView({block:'center',inline:'center'});", target
+        )
+        drv.execute_script("arguments[0].click();", target)
+
+
 @keyword("Fill By Attr")
 def fill_by_attr(attr_pair: str,
                  text: str,
