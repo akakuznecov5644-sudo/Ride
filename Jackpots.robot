@@ -87,5 +87,5 @@ Open Jackpot Create Form
     Click By Attr    data-menu-id="jackpotManager"
     Wait Until Page Has    xpath://span[contains(., 'Prizes')]
     Click By Attr    title="Create Jackpot"
-    Wait Until Page Has    xpath://div[contains(@class,'ant-modal-content')]//div[contains(@class,'ant-tabs-tab-btn') and normalize-space(.)='General']
-    Wait Until Page Has    xpath://div[contains(@class,'ant-modal-content')]//input[@id='code_desc' and not(@disabled)]
+    Wait Until Page Has    xpath://div[(contains(@class,'ant-modal-content') or contains(@class,'ant-modal-container'))]//div[@role='tab' and contains(@class,'ant-tabs-tab-btn') and normalize-space(.)='General']
+    Wait Until Page Has    xpath://div[(contains(@class,'ant-modal-content') or contains(@class,'ant-modal-container'))]//input[@id='code_desc' and not(@disabled)]
