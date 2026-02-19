@@ -81,6 +81,7 @@ Create Jackpot Lucky Chance Progressive
 
 *** Keywords ***
 Open Jackpot Create Form
+    Login
     Wait Until Page Has    xpath=//img[contains(@src, "/images/myacp.png")]    ${SEL_TIMEOUT}
     Click By Attr    data-menu-id="jackpots"
     Click By Attr    data-menu-id="jackpotManager"
