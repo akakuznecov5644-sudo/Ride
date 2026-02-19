@@ -1,6 +1,6 @@
 *** Settings ***
-Suite Setup       Open And Login Once
-Suite Teardown    Browser stop
+Test Setup        Open And Login Once
+Test Teardown     Browser stop
 Resource          common.robot
 Library           libs/Jackpots.py
 Library           libs/excel_params.py
@@ -81,7 +81,6 @@ Create Jackpot Lucky Chance Progressive
 
 *** Keywords ***
 Open Jackpot Create Form
-    Login
     Wait Until Page Has    xpath=//img[contains(@src, "/images/myacp.png")]    ${SEL_TIMEOUT}
     Click By Attr    data-menu-id="jackpots"
     Click By Attr    data-menu-id="jackpotManager"
