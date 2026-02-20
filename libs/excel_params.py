@@ -4862,7 +4862,7 @@ return (function(expected){
   const roots = document.querySelectorAll('.ant-notification');
   for (const root of roots){
     const nodes = root.querySelectorAll(
-      '.ant-notification-notice-message, .ant-notification-notice-description'
+      '.ant-notification-notice-message, .ant-notification-notice-title'
     );
     for (const n of nodes){
       const t = norm(n.textContent);
