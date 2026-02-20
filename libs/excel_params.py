@@ -572,7 +572,7 @@ def click_switch_by_text(text: str,
 
     # Один способ поиска: кликабельный пункт переключателя в модалке по точному тексту.
     xpath = (
-        "//div[contains(@class,'ant-modal-content') or contains(@class,'ant-modal-container')]"
+        "//div[contains(@class,'ant-modal-container')]"
         "//*[contains(@class,'ant-segmented-item') or contains(@class,'ant-radio-button-wrapper') "
         "or contains(@class,'ant-btn') or @role='button' or self::button or self::label or self::span or self::div]"
         f"[normalize-space(.)='{text}']"
