@@ -29,6 +29,27 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
+from libs.excel_params_2_extracted_helpers import (
+    _click_ok_in_filter,
+    _close_filter_dropdown_by_type,
+    _fill_date_in_filter,
+    _scroll_root_js,
+    _to_int_or_none,
+    _try_open_filter_with_keywords,
+    _try_select_option_with_keywords,
+)
+from libs.excel_params_2_extracted_keywords import (
+    clear_perf_log,
+    dump_performance_log,
+    enable_chrome_cdp,
+    fill_date_on_filter,
+    open_filter_by_attr,
+    scroll_x_by_attr,
+    scroll_x_page_by,
+    scroll_x_page_to,
+    searchable_select_by_attr,
+)
+
 CSS_DD = ".ant-select-dropdown:not(.ant-select-dropdown-hidden)"
 CSS_OPT = f"{CSS_DD} .ant-select-item-option"
 
@@ -403,36 +424,7 @@ def login():
         "xpath://img[contains(@src,'/images/myacp.png')]",
         BuiltIn().get_variable_value("${SEL_TIMEOUT}", "60 s")
     )
-@keyword("Enable Chrome CDP")
-def enable_chrome_cdp():
-    """
-    Включает прослушку Network.* через CDP.
-    """
-    sl = BuiltIn().get_library_instance("SeleniumLibrary")
-    drv = sl.driver
-    drv.execute_cdp_cmd("Network.enable", {
-        "maxTotalBufferSize":    10_000_000,
-        "maxResourceBufferSize": 5_000_000
-    })
-    drv.execute_cdp_cmd("Page.enable", {})
-    drv.execute_cdp_cmd("Log.enable", {})
-@keyword("Dump Performance Log")
-def dump_performance_log():
-    """
-    Сбрасывает весь накопленный performance-лог в консоль.
-    """
-    sl = BuiltIn().get_library_instance("SeleniumLibrary")
-    for e in sl.driver.get_log("performance"):
-        print(e)
 
-
-@keyword("Clear Perf Log")
-def clear_perf_log():
-    """
-    Мгновенно очищает performance-log: просто вычитываем все записи.
-    """
-    _ = BuiltIn().get_library_instance("SeleniumLibrary") \
-        .driver.get_log("performance")
 # ────────────────────────────────────────────────────────────────────
 # 7. Универсальный клик по атрибуту
 # ────────────────────────────────────────────────────────────────────
@@ -744,29 +736,6 @@ def select_by_attr(attr_pair: str,
     #_dbg(f"ОШИБКА: «{option_text}» не найдено")
     raise AssertionError(f"Опция «{option_text}» не найдена за {wait_sec} с")
 
-@keyword("Searchable Select By Attr")
-def searchable_select_by_attr(attr_pair: str,
-                              option_text: str,
-                              *,
-                              index: int | None = None,
-                              wait_sec: int = 10):
-    root, drv = _select_root(attr_pair, index)
-    _open_dropdown(root, drv)
-    attr, val = _parse(attr_pair)
-    css_repr  = f'css:[{attr}*="{val}"]'
-    BuiltIn().log(
-        f"Selecting option '{option_text}' in searchable '{css_repr}'", "INFO"
-    )
-    # 💡 универсальный поиск input
-    search = root.find_element(
-        By.CSS_SELECTOR,
-        "input[role='combobox'], input[type='search'].ant-select-selection-search-input"
-    )
-
-    drv.execute_script("arguments[0].value = '';", search)
-    search.send_keys(Keys.CONTROL, "a", Keys.DELETE, option_text)
-
-    _click_option(option_text, drv, strict=False, wait=wait_sec)
 
 
 @keyword("Wait Until Page Has")
@@ -1117,50 +1086,6 @@ def fill_text_on_filter(
             drv.execute_script("arguments[0].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',bubbles:true}))", field)
 
 
-@keyword("Fill Date On Filter")
-def fill_date_on_filter(date_text: str, timeout: float = 6.0, *, js_fallback: bool = True):
-    BuiltIn().log(f'Filling date "{date_text}" into the date input inside the open filter', "INFO")
-    sl = BuiltIn().get_library_instance("SeleniumLibrary")
-    drv = sl.driver
-
-    # ждём открытый фильтр
-    WebDriverWait(drv, timeout).until(
-        EC.visibility_of_element_located((By.CSS_SELECTOR, ".ant-dropdown:not(.ant-dropdown-hidden)"))
-    )
-
-    # правильный локатор: берем input внутри ant-picker(/ant-picker-input), но не hidden
-    xpath = (
-        "//div[contains(@class,'ant-dropdown') and not(contains(@class,'ant-dropdown-hidden'))]"
-        "//div[contains(@class,'ant-table-filter-dropdown')]"
-        "//div[contains(@class,'ant-picker')]//input[not(@type='hidden')]"
-    )
-    target = WebDriverWait(drv, timeout).until(
-        EC.visibility_of_element_located((By.XPATH, xpath))
-    )
-
-    # ввод
-    try:
-        target.click()
-        target.send_keys(Keys.CONTROL, "a", Keys.DELETE, date_text, Keys.ENTER)
-    except Exception:
-        if not js_fallback:
-            raise
-        drv.execute_script("arguments[0].scrollIntoView({block:'center',inline:'center'});", target)
-        drv.execute_script("arguments[0].focus();", target)
-        drv.execute_script("arguments[0].value = arguments[1];", target, date_text)
-        drv.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true}));", target)
-        drv.execute_script("arguments[0].dispatchEvent(new KeyboardEvent('keydown', {key:'Enter'}));", target)
-
-    # мягкая валидация: сравнение по цифрам (без разделителей), чтобы пережить форматирование AntD
-    import re as _re
-    expect_digits = _re.sub(r"\D", "", date_text or "")
-    def _ok():
-        v = (target.get_attribute("value") or "")
-        got_digits = _re.sub(r"\D", "", v)
-        return got_digits.startswith(expect_digits) or got_digits.endswith(expect_digits)
-
-    WebDriverWait(drv, timeout).until(lambda d: _ok())
-
 
 @keyword("Click By Attr On Filter")
 def click_by_attr_on_filter(
@@ -1235,9 +1160,6 @@ def click_by_attr_on_filter(
 def _drv():
     return BuiltIn().get_library_instance("SeleniumLibrary").driver
 
-def _scroll_root_js():
-    return "return document.scrollingElement || document.documentElement || document.body;"
-
 def _visible(el):
     try:
         return el.is_displayed()
@@ -1257,71 +1179,6 @@ def _last_visible_filter(drv, timeout: float = 0.5):
     except Exception:
         pass
     return None
-
-@keyword("Scroll X Page By")
-def scroll_x_page_by(px: int):
-    drv = _drv()
-    BuiltIn().log(f"Scroll X Page By {px}", "INFO")
-    drv.execute_script("""
-        const el = document.scrollingElement || document.documentElement || document.body;
-        el.scrollLeft = (el.scrollLeft || 0) + arguments[0];
-    """, int(px))
-
-@keyword("Scroll X Page To")
-def scroll_x_page_to(pos: str):
-    drv = _drv()
-    pos = (pos or "").strip().lower()
-    BuiltIn().log(f"Scroll X Page To {pos}", "INFO")
-    drv.execute_script("""
-        const el = document.scrollingElement || document.documentElement || document.body;
-        if (arguments[0]==='left')   el.scrollLeft = 0;
-        else if (arguments[0]==='right')  el.scrollLeft = el.scrollWidth;
-        else if (arguments[0]==='center') el.scrollLeft = Math.max(0, (el.scrollWidth - el.clientWidth)/2);
-        else el.scrollLeft = (el.scrollLeft || 0);
-    """, pos)
-
-def _parse(attr_pair: str):
-    # если у тебя уже есть _parse(attr_pair) — используй его и удали этот мини-парсер
-    a, v = attr_pair.split("=", 1)
-    return a.strip(), v.strip().strip('"').strip("'")
-
-@keyword("Scroll X By Attr")
-def scroll_x_by_attr(attr_pair: str,
-                     by: int | None = None,
-                     to: str | None = None,
-                     *,
-                     index: int | None = None,
-                     timeout: float = 8.0):
-    """
-    Скроллит горизонтально контейнер, найденный по attr="value_part".
-    Примеры:
-      Scroll X By Attr    class="ant-table-body"    by=400
-      Scroll X By Attr    class="ant-table-body"    to=right
-    """
-    drv = _drv()
-    a, v = _parse(attr_pair)
-    css = f'[{a}*="{v}"]'
-
-    # ждём контейнер и берём по index (1-based)
-    WebDriverWait(drv, timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, css)))
-    elems = drv.find_elements(By.CSS_SELECTOR, css)
-    if not elems:
-        raise AssertionError(f"Element not found by {css}")
-    el = elems[(index-1) if index else 0]
-
-    if to:
-        to = to.strip().lower()
-        BuiltIn().log(f'Scroll X By Attr {a}*="{v}" → to={to}', "INFO")
-        drv.execute_script("""
-            const el = arguments[0];
-            if (arguments[1]==='left')   el.scrollLeft = 0;
-            else if (arguments[1]==='right')  el.scrollLeft = el.scrollWidth;
-            else if (arguments[1]==='center') el.scrollLeft = Math.max(0, (el.scrollWidth - el.clientWidth)/2);
-        """, el, to)
-    else:
-        delta = int(by if by is not None else 300)
-        BuiltIn().log(f'Scroll X By Attr {a}*="{v}" → by={delta}', "INFO")
-        drv.execute_script("arguments[0].scrollLeft = (arguments[0].scrollLeft||0) + arguments[1];", el, delta)
 
 @keyword("Scroll X By Text")
 def scroll_x_by_text(text: str,
@@ -1397,80 +1254,6 @@ def scroll_x_by_text(text: str,
             fix = tiny if d > 0 else -tiny
             chains.scroll_from_origin(origin, int(fix), 0).pause(0.02).perform()
         last = new_d
-
-
-@keyword("Open Filter By Attr")
-def open_filter_by_attr(attr_pair: str, index: int | None = None, timeout: float = 8.0):
-    """
-    Открывает фильтр по паре атрибутов:  name="value"
-    Спецкейс: name == class → токенный матч (' foo ' внутри @class),
-    чтобы class=" TICKET_IN" не совпадал с PROMO_TICKET_IN.
-    """
-    import re
-
-    def _drv():
-        sl = BuiltIn().get_library_instance("SeleniumLibrary")
-        return sl.driver
-
-    def _xp_literal(s: str) -> str:
-        if '"' not in s:
-            return f'"{s}"'
-        if "'" not in s:
-            return f"'{s}'"
-        parts = s.split('"')
-        return "concat(" + ", '\"', ".join([f'"{p}"' for p in parts]) + ")"
-
-    def _class_token_pred(val: str) -> str:
-        tokens = [t for t in (val or "").split() if t]
-        if not tokens:
-            return "false()"
-        return " and ".join(
-            [f"contains(concat(' ', normalize-space(@class), ' '), ' {t} ')" for t in tokens]
-        )
-
-    m = re.match(r'^\s*([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*([\'"])(.*?)\2\s*$', attr_pair)
-    if not m:
-        raise AssertionError(f'Ожидалась строка формата name="value", получено: {attr_pair!r}')
-
-    attr = m.group(1).strip().lower()
-    val  = m.group(3)
-
-    if attr == "class":
-        pred = _class_token_pred(val)
-    else:
-        lit  = _xp_literal(val)
-        pred = f"contains(@{attr}, {lit})"
-
-    xp_header = (
-        "//th[contains(@class,'ant-table-cell') or contains(@class,'ant-table-filter-column')]"
-        f"[.//*[{pred}] or {pred}]"
-    )
-    xp_trigger = f"{xp_header}//span[contains(@class,'ant-table-filter-trigger')]"
-    if index:
-        xp_trigger = f"({xp_trigger})[{int(index)}]"
-
-    drv = _drv()
-    trig = WebDriverWait(drv, timeout).until(EC.element_to_be_clickable((By.XPATH, xp_trigger)))
-
-    drv.execute_script("arguments[0].scrollIntoView({block:'center',inline:'center'});", trig)
-    try:
-        trig.click()
-    except Exception:
-        try:
-            ActionChains(drv).move_to_element(trig).pause(0.05).perform()
-            drv.execute_script("arguments[0].click()", trig)
-        except Exception:
-            drv.execute_script("arguments[0].click()", trig)
-
-    try:
-        _wait_filter_dropdown(drv, timeout)
-    except Exception:
-        WebDriverWait(drv, timeout).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, ".ant-dropdown, .ant-popover, .ant-table-filter-dropdown")
-            )
-        )
-
 
 
 
@@ -1666,8 +1449,6 @@ def check_report_filters(
     if "final" in checks_when_set:
         _maybe_run_check(console_check_kw, _console_args, fail_on_check, "final")
         _maybe_run_check(network_check_kw, _network_args, fail_on_check, "final")
-
-
 
 
 
@@ -2317,38 +2098,6 @@ def _pick_cell_value(col_index: int, row_index: int = 1, max_scan_rows: int = 10
 
 # ─────────────── Открытие фильтра ЧЕРЕЗ КЕЙВОРДЫ + логи ───────────────
 
-def _try_open_filter_with_keywords(anchor: str, order_list: list[str], timeout: float = 6.0) -> str | None:
-    """Перебирает кейворды открытия по порядку, логирует попытки, ждёт оверлей."""
-    bi = BuiltIn()
-    drv = _drv()
-
-    for kind in order_list:
-        try:
-            if kind == "text":
-                _log(f"Open filter from \"{anchor}\" column via Open Text Filter")
-                bi.run_keyword("Open Text Filter", anchor)
-            elif kind == "numeric":
-                _log(f"Open filter from \"{anchor}\" column via Open Numeric Filter")
-                bi.run_keyword("Open Numeric Filter", anchor)
-            elif kind == "datetime":
-                _log(f"Open filter from \"{anchor}\" column via Open DateTime Filter")
-                bi.run_keyword("Open DateTime Filter", anchor)
-            elif kind == "multiselect":
-                _log(f"Open filter from \"{anchor}\" column via Open Multiselect Filter")
-                bi.run_keyword("Open Multiselect Filter", anchor)
-            else:
-                continue
-        except Exception as e:
-            _log(f"Open filter via {kind} — failed: {type(e).__name__}", level="DEBUG")
-            continue
-
-        if _wait_filter_dropdown_silent(drv, timeout=1.5):
-            detected = _detect_filter_type()
-            _log(f"Filter dropdown opened — detected: {detected}")
-            return detected if detected != "unknown" else kind
-
-    _log(f"Open filter from \"{anchor}\" column — all keyword attempts failed", level="DEBUG")
-    return None
 
 
 # ─────────────────────────── (Необязательный) фолбэк ───────────────────────────
@@ -2519,24 +2268,6 @@ def _detect_filter_type():
     return "unknown"
 
 
-def _click_ok_in_filter():
-    bi = BuiltIn()
-    # Всегда подтверждаем твоими кейвордами
-    try:
-        bi.run_keyword("Click By Text On Filter", "OK")
-        return
-    except Exception:
-        pass
-    try:
-        bi.run_keyword("Click By Attr On Filter", 'aria-label="check-circle"')
-        return
-    except Exception:
-        pass
-    try:
-        bi.run_keyword("Click By Text On Filter", "Apply")
-    except Exception:
-        pass
-
 
 def _click_header_sorter_multiple_times(th, anchor: str, *, times: int = 4, timeout: float = 4.0, delay: float = 0.1) -> bool:
     """Кликает по сортировщику в заголовке несколько раз, с учётом возможного DOM-обновления."""
@@ -2641,41 +2372,6 @@ def _clear_all_filters_if_present():
 
 # ─────────────────────────── Вспомогательные утилиты ───────────────────────────
 
-def _try_select_option_with_keywords(value: str) -> bool:
-    """
-    Мультиселекты: сначала пробуем Click By Text On Filter,
-    если не нашли — вычисляем data-menu-id по тексту и кликаем
-    строго форматом data-menu-id="...".
-    """
-    bi = BuiltIn()
-    target = str(value).strip()
-
-    # 1) По тексту
-    try:
-        _log(f'Try select by text: "{target}"')
-        bi.run_keyword("Click By Text On Filter", target)
-        return True
-    except Exception:
-        pass
-
-    # 2) По data-menu-id (ровно в формате data-menu-id="…")
-    dm_id = _resolve_data_menu_id_for_option(target)
-    if dm_id:
-        attr = f'data-menu-id="{dm_id}"'
-        _log(f'Try select by attr: {attr}')
-        try:
-            bi.run_keyword("Click By Attr On Filter", attr)
-            return True
-        except Exception:
-            # иногда попадает в общий контейнер
-            try:
-                bi.run_keyword("Click By Attr", attr)
-                return True
-            except Exception:
-                return False
-
-    _log("Option not found by text nor data-menu-id", level="DEBUG")
-    return False
 
 def _resolve_data_menu_id_for_option(display_text: str) -> str | None:
     """
@@ -2787,11 +2483,6 @@ def _to_int(v, default=None):
     except Exception:
         return default
 
-def _to_int_or_none(v):
-    if v in (None, "", "None"):
-        return None
-    return _to_int(v, None)
-
 def _to_float(v, default=None):
     try:
         return float(str(v).replace(",", ".").strip())
@@ -2823,37 +2514,6 @@ def _to_max_columns(v):
         raise ValueError("max_columns must be an integer or 'all'")
 
 
-
-def _fill_date_in_filter(value: str):
-    """
-    Для фильтров даты/даты-времени вводим значение исключительно через
-    твой кейворд Fill Date By Attr с placeholder="Select date".
-    Если этот placeholder не найден (нестандартная локализация/верстка),
-    пробуем короткие фолбэки, но приоритет — ровно "Select date".
-    """
-    bi = BuiltIn()
-    # 1) Требуемый способ
-    try:
-        bi.run_keyword("Fill Date By Attr", 'placeholder="Select date"', value)
-        return
-    except Exception as e:
-        _log(f'[FILTER-DATE] primary placeholder failed: {type(e).__name__}', level="DEBUG")
-
-    # 2) Аккуратные фолбэки (на всякий случай; можно убрать, если хочешь только один вариант)
-    fallbacks = (
-        'placeholder="Select Date"',
-        'placeholder="Дата"',
-        'placeholder="Выберите дату"',
-    )
-    for ph in fallbacks:
-        try:
-            bi.run_keyword("Fill Date By Attr", ph, value)
-            return
-        except Exception:
-            continue
-
-    # 3) Ничего не подошло — бросаем, чтобы верхний try/except залогировал WARN
-    raise RuntimeError("Date input inside filter not found by placeholder")
 
 def _normalize_checks_when(s: str) -> set[str]:
     """
@@ -2953,13 +2613,6 @@ def _header_by_title(title: str):
             return th
     return None
 
-def _close_filter_dropdown_by_type(detected: str):
-    # мягкое закрытие — без Reset для text/numeric/datetime
-    drv = _drv()
-    try:
-        drv.switch_to.active_element.send_keys(Keys.ESCAPE)
-    except Exception:
-        pass
 
 def _resolve_filter_type_without_open(anchor: str) -> str:
     """Определяет тип БЕЗ открытия: по <th> и/или по attr-паре."""
